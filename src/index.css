@@ -1,0 +1,72 @@
+@import "tailwindcss";
+
+/* GestureDrive design tokens. One locked dark theme, one accent (electric blue).
+   Red is reserved for the Stop command only. Green marks a live connection only.
+   Radius rule: panels 16px, controls 12px, pills full. */
+@theme {
+  --color-bg: #09090b;
+  --color-surface: #131317;
+  --color-surface-2: #1b1b21;
+  --color-line: #26262d;
+  --color-line-strong: #34343d;
+  --color-ink: #ededf0;
+  --color-dim: #a1a1aa;
+  --color-faint: #6f6f78;
+
+  --color-accent: #3b82f6;
+  --color-accent-strong: #2563eb;
+  --color-stop: #ef4444;
+  --color-ok: #22c55e;
+
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, "SF Mono", monospace;
+
+  --radius-panel: 16px;
+  --radius-control: 12px;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Ambient field behind the app. Static radial wash tinted to the accent,
+   not an animated AI-glow. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(60rem 40rem at 78% -10%, rgb(59 130 246 / 0.10), transparent 60%),
+    radial-gradient(50rem 40rem at 8% 112%, rgb(59 130 246 / 0.05), transparent 55%);
+}
+
+::selection {
+  background: rgb(59 130 246 / 0.28);
+}
+
+*:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
