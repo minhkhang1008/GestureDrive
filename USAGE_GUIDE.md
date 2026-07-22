@@ -1,323 +1,204 @@
 # Hướng dẫn sử dụng GestureDrive
 
-Tài liệu này dành cho cả 3 nhóm: nhóm app (bạn), nhóm AI nhận diện cử chỉ, và
-nhóm phần cứng ESP32. Đọc phần tương ứng với việc bạn đang làm.
+Tài liệu này là hợp đồng chung cho nhóm AI, nhóm app và nhóm phần cứng.
 
-## Mục lục
+## 1. Chuẩn bị
 
-1. [Cài đặt và chạy app](#1-cài-đặt-và-chạy-app)
-2. [Dùng app không cần phần cứng (chế độ giả lập)](#2-dùng-app-không-cần-phần-cứng-chế-độ-giả-lập)
-3. [Kết nối với ESP32](#3-kết-nối-với-esp32)
-4. [Nạp firmware mẫu cho ESP32](#4-nạp-firmware-mẫu-cho-esp32)
-5. [Dùng app với camera thật](#5-dùng-app-với-camera-thật)
-6. [Chế độ AUTO và MANUAL](#6-chế-độ-auto-và-manual)
-7. [Liên kết với nhóm AI nhận diện cử chỉ](#7-liên-kết-với-nhóm-ai-nhận-diện-cử-chỉ)
-8. [Xử lý sự cố thường gặp](#8-xử-lý-sự-cố-thường-gặp)
-9. [Các file cần biết khi chỉnh sửa](#9-các-file-cần-biết-khi-chỉnh-sửa)
-10. [Checklist trước khi demo](#10-checklist-trước-khi-demo)
+- Chrome hoặc Edge trên máy tính.
+- Node.js 20 trở lên.
+- Hai ESP32 nguyên bản có Bluetooth Classic.
+- ESP1 đã nạp sketch `esp sketch/send/send/send.ino`.
+- ESP2 đã nạp sketch `esp sketch/receive/receive.ino`.
+- Đã điền đúng MAC Wi-Fi STA của ESP2 vào `receiverMac` trên ESP1.
+- Đã sửa chân motor trong sketch ESP2 theo mạch thật.
 
----
+Ứng dụng không có chế độ giả lập. Khi chưa kết nối ESP1, camera vẫn có thể nhận
+dạng để kiểm tra thuật toán nhưng giao diện luôn báo chưa có đường truyền thật.
 
-## 1. Cài đặt và chạy app
-
-Yêu cầu: Node.js đã cài sẵn (khuyến nghị bản 20 trở lên), trình duyệt
-**Google Chrome hoặc Microsoft Edge** trên máy tính (Windows/macOS/Linux đều
-được, miễn là bản desktop, không dùng trên điện thoại).
+## 2. Khởi động
 
 ```bash
-cd gesturedrive-app
 npm install
 npm run dev
 ```
 
-Terminal sẽ in ra một địa chỉ dạng `http://localhost:5173`. Mở địa chỉ đó bằng
-Chrome hoặc Edge.
+1. Mở địa chỉ Vite bằng Chrome hoặc Edge.
+2. Bật nguồn ESP2 trên xe.
+3. Cắm ESP1 vào laptop bằng cáp USB dữ liệu.
+4. Bấm **Kết nối ESP1**, chọn cổng CP210x hoặc CH340 tương ứng.
+5. Quan sát trạng thái trên thanh trên:
+   - **ESP-NOW**: đường chính đang hoạt động.
+   - **Bluetooth**: ESP1 đã tự chuyển sang đường dự phòng.
+   - **Mất ESP2**: USB tới ESP1 còn hoạt động nhưng chưa tới được xe.
+6. Bấm **Bật camera** và cấp quyền camera.
 
-> Tại sao phải là Chrome/Edge? App dùng **Web Serial API** để nói chuyện với
-> ESP32 qua cổng serial. Firefox và Safari chưa hỗ trợ API này.
+## 3. Xác nhận vai trò hai tay
 
-Để đóng gói bản chạy thật (không cần server dev) khi thuyết trình:
+Đặt một tay ở nửa trái và một tay ở nửa phải của khung camera. Hai tay không bắt
+buộc theo tay trái/tay phải sinh học.
 
-```bash
-npm run build
-npm run preview
-```
+1. Xòe tay muốn dùng để điều hướng.
+2. Nắm tay muốn dùng để điều khiển tốc độ.
+3. Giữ ổn định trong tám khung hình.
+4. Khi thành công, app hiện nhãn **TAY ĐIỀU HƯỚNG**, **TAY TỐC ĐỘ**, tâm joystick
+   và thanh tốc độ đúng bên.
 
-Lệnh `build` sẽ báo lỗi kiểu (TypeScript) nếu có, nên chạy thử trước ngày báo
-cáo để chắc chắn không có lỗi ẩn.
+Quy ước cố định trong bản này:
 
----
+- Tay xòe lúc xác nhận = tay điều hướng.
+- Tay nắm lúc xác nhận = tay tốc độ.
 
-## 2. Dùng app không cần phần cứng (chế độ giả lập)
+Muốn đổi vai trò, đưa cả hai tay ra khỏi camera ít nhất 0,8 giây. App dừng xe,
+xóa hiệu chuẩn và chờ thao tác xòe - nắm mới.
 
-Khi mở app lần đầu, dưới thanh trên cùng có dòng **"Chưa có ESP32? Chạy thử ở
-chế độ giả lập"**. Bấm vào đó.
+## 4. Điều hướng
 
-Ở chế độ này:
+Tâm lòng bàn tay lúc xác nhận được lưu làm gốc joystick. Di chuyển tay quanh gốc
+để chọn một trong chín vùng:
 
-- App hoạt động y hệt bình thường (camera, nhận diện, đổi chế độ AUTO/MANUAL,
-  nhật ký lệnh).
-- Lệnh vẫn được "gửi" trên giao diện (thẻ Lệnh hiện tại báo Đã gửi qua
-  Bluetooth) nhưng thực ra không có gì được truyền ra ngoài qua dây.
-- Dùng chế độ này để tập dượt bài thuyết trình, quay demo, hoặc để nhóm AI
-  kiểm tra giao diện mà không cần chờ xe lắp xong.
+| Vị trí | Hướng |
+| --- | --- |
+| Tâm | Dừng |
+| Trên | Đi thẳng |
+| Trên trái | Chếch trái |
+| Trên phải | Chếch phải |
+| Trái | Quay tại chỗ sang trái |
+| Phải | Quay tại chỗ sang phải |
+| Dưới | Đi lùi |
+| Dưới trái | Lùi chếch trái |
+| Dưới phải | Lùi chếch phải |
 
-Muốn ngắt chế độ giả lập và chuyển sang kết nối thật: bấm **Ngắt** ở góc trên
-bên phải, rồi làm theo mục 3.
+Ba hướng trên chỉ hợp lệ khi lòng bàn tay hướng vào camera. Ba hướng dưới chỉ
+hợp lệ khi mu bàn tay hướng vào camera. Nếu mặt tay chưa đúng, app hiển thị hướng
+dẫn và phát trạng thái dừng.
 
----
+Vùng dừng mặc định có bán kính `0.035` theo tọa độ chuẩn hóa camera. Bốn khung
+hình liên tiếp phải cùng một hướng trước khi hướng đó có hiệu lực. Hai lớp này
+loại rung tay nhưng vẫn giữ phản hồi nhanh.
 
-## 3. Kết nối với ESP32
+## 5. Điều khiển tốc độ
 
-ESP32 dùng thư viện `BluetoothSerial` (Bluetooth Classic, giao thức SPP -
-Serial Port Profile). Với giao thức này, sau khi ghép đôi (pair), máy tính sẽ
-thấy ESP32 như một **cổng Serial ảo**, giống hệt như cắm dây USB. App tận dụng
-đúng điều này qua Web Serial API, không cần thư viện Bluetooth phức tạp.
+Trên tay tốc độ:
 
-### Cách A: Qua Bluetooth (không dây, dùng khi demo)
+1. Thu ngón giữa, áp út và út.
+2. Duỗi ngón trỏ và ngón cái để mở khóa thanh kéo.
+3. Đưa ngón trỏ lên để tăng PWM, đưa xuống để giảm PWM.
+4. Thu ngón cái nhưng giữ ngón trỏ để khóa tốc độ hiện tại.
 
-1. Bật ESP32, đảm bảo firmware đã chạy `SerialBT.begin("ESP32-Micromouse")`
-   (xem mục 4).
-2. Trên máy tính, mở phần cài đặt Bluetooth của hệ điều hành (không phải
-   trong app):
-   - **Windows:** Settings → Bluetooth & devices → Add device.
-   - **macOS:** System Settings → Bluetooth.
-3. Tìm thiết bị tên `ESP32-Micromouse` (hoặc tên bạn đặt trong firmware) và
-   ghép đôi. Không cần mã PIN, hoặc dùng `1234`/`0000` nếu được hỏi.
-4. Sau khi ghép đôi thành công, quay lại app, bấm **Kết nối ESP32** ở thanh
-   trên. Trình duyệt sẽ hiện hộp thoại chọn cổng, chọn cổng có tên chứa
-   `ESP32-Micromouse` hoặc dạng `/dev/tty.*` (macOS) / `COM*` (Windows).
-5. Thẻ trạng thái ở góc trên chuyển sang chấm xanh + tên cổng nghĩa là đã kết
-   nối xong.
+Thanh tốc độ dùng khoảng dọc từ 14% tới 86% chiều cao camera và ánh xạ thành
+PWM 255 tới 0. Thay đổi nhỏ dưới 4 PWM bị bỏ qua để chống rung.
 
-### Cách B: Qua cáp USB (ổn định hơn, dùng khi kiểm thử)
-
-1. Cắm ESP32 vào máy tính bằng cáp USB (loại có dây dữ liệu, không phải cáp
-   chỉ sạc).
-2. Bấm **Kết nối ESP32** trên app, chọn cổng USB tương ứng (thường có tên
-   như `Silicon Labs CP210x` hoặc `CH340`).
-3. Lưu ý: khi cắm USB, ESP32 nhận lệnh qua `Serial` (USB) chứ không phải
-   `SerialBT`. Nếu firmware chỉ lắng nghe `SerialBT`, bạn cần thêm nhánh đọc
-   từ `Serial` khi test qua USB (xem chú thích trong mục 4).
-
-### Nếu macOS không hiện cổng Bluetooth SPP
-
-Một số phiên bản macOS không cho phép trình duyệt liệt kê cổng serial ảo tạo
-ra từ Bluetooth Classic. Nếu gặp trường hợp này:
-
-- Ưu tiên dùng **Cách B (USB)** khi demo tại chỗ, ổn định và không phụ thuộc
-  hệ điều hành.
-- Nếu bắt buộc phải không dây và USB không khả thi, cần dựng một cầu nối nhỏ
-  (ví dụ script Python đọc cổng Bluetooth rồi mở một WebSocket) và thay lớp
-  truyền trong `src/hooks/useSerialConnection.ts`. Đây là việc kỹ thuật thêm,
-  không bắt buộc nếu USB đã đủ dùng cho buổi báo cáo.
-
----
-
-## 4. Nạp firmware mẫu cho ESP32
-
-File `README.md` trong thư mục này có sẵn một sketch Arduino mẫu, đầy đủ để
-chạy thử ngay. Sao chép đoạn đó vào Arduino IDE, sửa lại số chân GPIO theo
-mạch driver động cơ của bạn (ví dụ L298N, TB6612), rồi nạp vào ESP32.
-
-Các điểm quan trọng nhóm phần cứng cần nhớ:
-
-- `SerialBT.begin("ESP32-Micromouse")`: tên này sẽ hiện ra khi ghép đôi
-  Bluetooth. Đặt tên dễ nhận diện, tránh trùng với ESP32 khác trong phòng thi.
-- App gửi **đúng 1 ký tự ASCII** mỗi lần có lệnh mới: `F`, `B`, `L`, `R`, hoặc
-  `S`. Không có ký tự xuống dòng hay khoảng trắng đi kèm.
-- App **không gửi lệnh lặp lại liên tục**. Ở chế độ AUTO, chỉ gửi khi lệnh
-  thay đổi. Vì vậy firmware nên **giữ nguyên trạng thái động cơ cho đến khi
-  nhận ký tự mới**, không dùng kiểu "phải nhận liên tục mới chạy".
-- Nếu bạn muốn test bằng USB thay vì Bluetooth trong lúc lắp ráp, dùng khối
-  sau song song với `SerialBT`:
-
-  ```cpp
-  void loop() {
-    char c = 0;
-    if (SerialBT.available()) c = SerialBT.read();
-    else if (Serial.available()) c = Serial.read();  // để test qua cáp USB
-
-    switch (c) {
-      case 'F': leftMotor(1);  rightMotor(1);  break;
-      case 'B': leftMotor(-1); rightMotor(-1); break;
-      case 'L': leftMotor(-1); rightMotor(1);  break;
-      case 'R': leftMotor(1);  rightMotor(-1); break;
-      case 'S': leftMotor(0);  rightMotor(0);  break;
-    }
-  }
-  ```
-
-- **Khuyến nghị an toàn:** thêm timeout phần cứng. Nếu ESP32 không nhận được
-  ký tự nào trong khoảng 2-3 giây, tự động dừng động cơ (`leftMotor(0);
-  rightMotor(0);`). App đã có cơ chế tự gửi `S` khi mất dấu bàn tay quá 1
-  giây, nhưng nếu mất kết nối Bluetooth hoàn toàn thì ESP32 sẽ không nhận
-  được gì cả, nên có một lớp an toàn ở firmware là tốt nhất.
-
----
-
-## 5. Dùng app với camera thật
-
-1. Đảm bảo đã kết nối ESP32 (mục 3) hoặc đang ở chế độ giả lập (mục 2).
-2. Ở khung "Camera trực tiếp", bấm **Bật camera**.
-3. Trình duyệt sẽ hỏi quyền truy cập camera, bấm **Cho phép/Allow**.
-4. Lần đầu tiên, app cần vài giây để tải mô hình AI nhận diện bàn tay
-   (khoảng 5-10 MB, đã ưu tiên chỉ tải khi bật camera để trang mở nhanh).
-5. Đưa một bàn tay vào khung hình. Bộ khung xương của bàn tay sẽ hiện lên
-   (các chấm và đường màu xanh), kèm khung dò tìm nét đứt.
-6. Nếu đang ở chế độ AUTO, lệnh sẽ tự động cập nhật theo cử chỉ (xem bảng cử
-   chỉ ở mục 6). Nếu đang ở MANUAL, khung camera vẫn hiển thị nhưng ghi chú
-   "AI tạm dừng", vì lệnh lúc này đến từ bàn phím/nút bấm.
-
-Mẹo khi demo: đặt camera ngang tầm ngực, ánh sáng đủ sáng và đều, tránh ngược
-sáng (đứng quay lưng ra cửa sổ), giữ nền phía sau không quá lộn xộn để mô hình
-dễ khoanh vùng bàn tay.
-
----
+Khóa tốc độ chỉ ngăn cập nhật thanh kéo. Tay điều hướng vẫn tiếp tục điều khiển
+xe bằng mức tốc độ đã giữ.
 
 ## 6. Chế độ AUTO và MANUAL
 
-Chuyển đổi bằng công tắc **AUTO / MANUAL** ở góc trên bên phải.
+### AUTO
 
-### AUTO (điều khiển bằng cử chỉ)
+- Nhận lệnh từ hai tay.
+- Thiếu một tay thì dừng sau 300 ms.
+- Cả hai tay rời khung 0,8 giây thì xóa vai trò.
+- App gửi heartbeat tới ESP1 mỗi 200 ms.
 
-| Ký tự | Lệnh    | Cử chỉ mặc định            |
-| ----- | ------- | -------------------------- |
-| `F`   | Tiến    | Xòe cả bàn tay (5 ngón)     |
-| `B`   | Lùi     | Xòe 4 ngón, gập ngón cái    |
-| `L`   | Rẽ trái | Chỉ ngón trỏ sang trái      |
-| `R`   | Rẽ phải | Chỉ ngón trỏ sang phải      |
-| `S`   | Dừng    | Nắm chặt bàn tay            |
+### MANUAL
 
-Quy tắc chống nhiễu: app chỉ gửi lệnh mới khi cử chỉ đó **giữ ổn định trong
-vài khung hình liên tiếp** và **khác với lệnh đang chạy**. Nếu bạn giữ nguyên
-một cử chỉ, app sẽ không gửi lại lệnh đó liên tục, tránh làm nghẽn kết nối
-Bluetooth.
+Dùng để kiểm tra motor và căn vị trí xe. Bàn điều khiển có đủ 8 hướng, nút dừng
+và thanh PWM 0-255.
 
-Quy tắc an toàn: nếu AI không thấy bàn tay nào trong khung hình liên tục hơn
-1 giây, app tự động gửi lệnh `S` (Dừng), phòng trường hợp bạn bước ra khỏi
-khung hình mà quên dừng xe.
+- `W`: tiến.
+- `S`: lùi.
+- `A`: quay trái.
+- `D`: quay phải.
+- `Space`: dừng.
 
-### MANUAL (điều khiển bằng tay)
+Mỗi lần chuyển AUTO/MANUAL, app gửi dừng trước để lệnh từ chế độ cũ không tiếp
+tục chạy.
 
-Dùng khi cần điều khiển chính xác, ví dụ để căn chỉnh vị trí xe trước khi bắt
-đầu phần demo AUTO. Có 2 cách gửi lệnh:
+## 7. Luồng ESP-NOW và Bluetooth dự phòng
 
-- Bấm trực tiếp vào các nút mũi tên/nút Dừng trên giao diện (bàn phím ảo).
-- Dùng phím trên bàn phím thật: `W` (tiến), `S` (lùi), `A` (rẽ trái), `D`
-  (rẽ phải), `Space` (dừng).
+Laptop luôn nói chuyện với ESP1 qua USB Serial. Bluetooth không thay thế cáp
+laptop - ESP1, mà là đường dự phòng ESP1 - ESP2.
 
-Ở chế độ này, camera vẫn bật (nếu bạn muốn) nhưng AI không gửi lệnh, để tránh
-xung đột giữa cử chỉ vô tình và lệnh bạn đang bấm tay.
+ESP1 gửi gói điều khiển mỗi 100 ms:
 
----
+1. Mặc định gửi qua ESP-NOW Long Range.
+2. Sau ba callback gửi thất bại, nếu Bluetooth đã kết nối thì chuyển sang SPP.
+3. Khi đang dùng Bluetooth, ESP1 vẫn thử ESP-NOW mỗi giây.
+4. Sau ba lần ESP-NOW thành công liên tiếp, ESP1 tự quay lại đường chính.
+5. ESP1 in trạng thái `LINK:*` qua USB để app cập nhật giao diện.
 
-## 7. Liên kết với nhóm AI nhận diện cử chỉ
+Cả hai ESP phải dùng `ESPNOW_CHANNEL = 6`. Nếu đổi kênh, sửa cùng giá trị trong
+cả hai sketch.
 
-Đây là phần quan trọng nhất để 2 nhóm làm việc song song mà không giẫm chân
-nhau. Chốt "hợp đồng" sau càng sớm càng tốt.
+## 8. Giao thức giữa ba nhóm
 
-### Hợp đồng dữ liệu
+### App tới ESP1
 
-Bộ nhận diện cử chỉ (dù do nhóm AI viết riêng hay dùng lại phần trong app
-này) chỉ cần trả về **đúng 1 trong 6 giá trị** mỗi khung hình:
-
-```
-"F" | "B" | "L" | "R" | "S" | null
+```text
+GD,sequence,leftMotor,rightMotor,speed,direction,flags\n
 ```
 
-`null` nghĩa là không nhận diện được cử chỉ nào rõ ràng (ví dụ tay đang
-chuyển động giữa 2 tư thế). App tự lo phần "giữ ổn định qua vài khung hình
-rồi mới gửi", nhóm AI không cần tự làm việc chống nhiễu ở phía họ.
-
-### Nếu nhóm AI dùng chung code MediaPipe của app này
-
-Toàn bộ logic đọc landmark bàn tay và suy ra lệnh nằm gọn trong 1 file:
-
-```
-src/lib/gestureRecognition.ts
-```
-
-Hàm `recognizeGesture(landmarks, handedness)` nhận vào 21 điểm mốc bàn tay
-theo chuẩn MediaPipe Hands và trả về `{ code, name, fingers }`. Nhóm AI có
-thể:
-
-- Sửa trực tiếp hàm này nếu muốn đổi cách nhận diện (ví dụ dùng góc ngón tay
-  thay vì so sánh tọa độ y).
-- Hoặc thay hẳn bằng mô hình riêng của họ, miễn là hàm cuối cùng trả về đúng
-  1 trong 5 ký tự lệnh hoặc `null`.
-
-File `src/hooks/useHandTracking.ts` là nơi gọi camera, chạy mô hình MediaPipe
-theo từng khung hình, và gọi `recognizeGesture`. Đây là nơi cắm mô hình AI
-khác vào nếu nhóm AI muốn dùng một pipeline hoàn toàn riêng (ví dụ chạy một
-mô hình Python qua WebSocket thay vì chạy MediaPipe ngay trong trình duyệt).
-
-### Nếu nhóm AI chạy mô hình riêng ở Python (không dùng trình duyệt)
-
-Nếu mô hình AI của nhóm bạn không chạy được trong trình duyệt (ví dụ dùng
-PyTorch, OpenCV riêng), cách đơn giản nhất là:
-
-1. Nhóm AI viết một script Python đọc camera, chạy mô hình, và khi có lệnh
-   mới thì gửi 1 ký tự (`F`/`B`/`L`/`R`/`S`) qua **WebSocket** tới app.
-2. Nhóm app thêm một client WebSocket nhỏ trong app, nhận ký tự đó và gọi
-   thẳng hàm gửi lệnh hiện có (giống hệt cách `useHandTracking` đang gọi
-   `onStableCommand` trong `src/App.tsx`).
-3. Lúc này khung "Camera trực tiếp" trên giao diện có thể hiển thị hình ảnh
-   test riêng hoặc ẩn đi, không bắt buộc phải trùng với camera app đang chạy.
-
-Cách này tách biệt hoàn toàn 2 nhóm: nhóm AI không cần biết gì về React/Web
-Serial, nhóm app không cần biết gì về mô hình nhận diện, chỉ cần thống nhất
-đúng 5 ký tự lệnh ở trên.
-
-### Việc cần thống nhất trước khi mỗi nhóm code
-
-- 5 ký tự lệnh và ý nghĩa (bảng ở mục 6) - đã cố định trong `commands.ts`, đổi
-  gì cũng nên thông báo cho nhóm kia.
-- Tốc độ khung hình mong đợi (app hiện chạy quanh 20-30 FPS tùy máy).
-- Ai chịu trách nhiệm phần chống nhiễu (khuyến nghị: giữ ở app như hiện tại,
-  để nhóm AI chỉ cần trả kết quả thô mỗi khung hình).
-
----
-
-## 8. Xử lý sự cố thường gặp
-
-| Hiện tượng | Nguyên nhân khả dĩ | Cách xử lý |
+| Trường | Miền giá trị | Ý nghĩa |
 | --- | --- | --- |
-| Nút "Kết nối ESP32" không làm gì, hoặc báo lỗi trình duyệt không hỗ trợ | Đang dùng Firefox/Safari | Chuyển sang Chrome hoặc Edge |
-| Không thấy cổng ESP32 trong hộp thoại chọn cổng | Chưa ghép đôi Bluetooth, hoặc cáp USB chỉ có dây sạc | Ghép đôi lại trong Settings hệ điều hành, hoặc đổi cáp USB có dây dữ liệu |
-| Kết nối được nhưng xe không chạy | Firmware chưa đọc đúng cổng (`SerialBT` và `Serial` không phải cùng luồng dữ liệu) | Kiểm tra mục 4, chắc chắn firmware đọc đúng nguồn đang dùng |
-| Camera không bật, trình duyệt báo bị từ chối quyền | Người dùng đã bấm Từ chối trước đó | Vào cài đặt trang web của trình duyệt (biểu tượng ổ khóa cạnh địa chỉ), cấp lại quyền Camera, tải lại trang |
-| Camera bật nhưng không thấy khung xương bàn tay | Ánh sáng yếu, tay ở rìa khung hình, hoặc mô hình chưa tải xong | Đợi vài giây, đưa tay vào giữa khung, tăng ánh sáng |
-| Lệnh gửi liên tục dù không đổi cử chỉ | Đang ở MANUAL và giữ phím, hoặc cử chỉ thật sự đang đổi qua lại | Đây là hành vi đúng ở MANUAL (mỗi lần bấm là 1 lệnh); ở AUTO hãy giữ tay ổn định hơn |
-| Xe không tự dừng khi thu tay lại | Firmware chưa xử lý ký tự `S`, hoặc mất kết nối Bluetooth hoàn toàn | Kiểm tra `case 'S'` trong firmware; thêm timeout an toàn như gợi ý ở mục 4 |
+| `sequence` | 0-65535 | Số thứ tự gói USB |
+| `leftMotor` | -255 đến 255 | Dấu là chiều quay, trị tuyệt đối là PWM |
+| `rightMotor` | -255 đến 255 | Dấu là chiều quay, trị tuyệt đối là PWM |
+| `speed` | 0-255 | Mức thanh tốc độ |
+| `direction` | 0-8 | Dừng, 8 hướng theo bảng dưới |
+| `flags` | bit field | Bit 0 bằng 1 khi tốc độ đã khóa |
 
----
+| Mã hướng | Giá trị |
+| --- | ---: |
+| Dừng | 0 |
+| Tiến | 1 |
+| Lùi | 2 |
+| Trái | 3 |
+| Phải | 4 |
+| Chếch trái | 5 |
+| Chếch phải | 6 |
+| Lùi chếch trái | 7 |
+| Lùi chếch phải | 8 |
 
-## 9. Các file cần biết khi chỉnh sửa
+### ESP1 tới ESP2
 
-| Muốn đổi gì | Sửa ở đâu |
+`DrivePacket` dài 13 byte, có cùng trường motor, tốc độ, hướng và cờ. Gói thêm
+magic `0x4744`, version và checksum XOR. ESP-NOW và Bluetooth dùng đúng cùng một
+cấu trúc để tránh hai nhánh firmware xử lý khác nhau.
+
+## 9. Ba lớp dừng an toàn
+
+| Lớp | Timeout | Tác dụng |
+| --- | ---: | --- |
+| App | 300 ms | Dừng khi không còn đủ hai tay |
+| ESP1 | 600 ms | Dừng khi tab bị treo, mất USB hoặc mất heartbeat |
+| ESP2 | 700 ms | Dừng khi mất cả ESP-NOW và Bluetooth |
+
+Không tăng timeout nếu chưa kiểm tra quãng đường xe tiếp tục trôi ở tốc độ tối
+đa.
+
+## 10. Xử lý sự cố
+
+| Hiện tượng | Kiểm tra |
 | --- | --- |
-| Ký tự lệnh, tên tiếng Việt, mô tả động cơ | `src/lib/commands.ts` |
-| Cách nhận diện cử chỉ (ánh xạ tư thế tay sang lệnh) | `src/lib/gestureRecognition.ts` |
-| Số khung hình cần ổn định trước khi gửi lệnh (chống nhiễu) | `stableFrames` trong `src/hooks/useHandTracking.ts`, gọi từ `src/App.tsx` |
-| Thời gian chờ trước khi tự dừng khi mất dấu tay | Số `1000` (mili-giây) trong `src/App.tsx` |
-| Phím tắt ở chế độ MANUAL | `KEY_MAP` trong `src/App.tsx` |
-| Cách kết nối ESP32 (Web Serial, baud rate) | `src/hooks/useSerialConnection.ts` |
-| Giao diện, màu sắc, bố cục | các file trong `src/components/`, token màu ở `src/index.css` |
+| Không có nút chọn cổng | Dùng Chrome/Edge desktop, không dùng Safari/Firefox |
+| Không thấy ESP1 | Đổi cáp USB dữ liệu, cài driver CP210x/CH340 |
+| App báo mất ESP2 | Kiểm tra nguồn ESP2, MAC trong ESP1, kênh 6 và LR trên cả hai |
+| ESP-NOW luôn lỗi | Đảm bảo MAC lấy từ `WiFi.macAddress()` của ESP2, không dùng MAC Bluetooth |
+| Bluetooth không kết nối | Cả hai board phải là ESP32 nguyên bản, tên ESP2 phải là `GestureDrive-ESP2` |
+| Nhận sai vai trò | Đưa cả hai tay ra 0,8 giây, vào lại hai nửa màn hình và giữ xòe - nắm |
+| Không nhận hướng lùi | Quay mu bàn tay về camera trước khi kéo xuống |
+| Tốc độ không đổi | Chỉ duỗi ngón trỏ + cái, thu ba ngón còn lại |
+| Xe chạy ngược | Đổi dây motor hoặc đổi cặp `IN1/IN2` của bánh đó trong sketch |
+| Hai bánh lệch tốc độ | Hiệu chỉnh riêng PWM motor hoặc thay `TURN_RATIO` sau khi đo thực tế |
 
----
+## 11. Checklist trước khi chạy xe
 
-## 10. Checklist trước khi demo
-
-- [ ] Đã sạc đầy pin ESP32 và pin/nguồn động cơ.
-- [ ] Đã ghép đôi Bluetooth giữa máy tính dùng để demo và ESP32 (ghép trước,
-      không ghép ngay tại chỗ để tránh mất thời gian).
-- [ ] Đã chạy thử `npm run build && npm run preview` ít nhất 1 lần để chắc
-      chắn không có lỗi biên dịch.
-- [ ] Đã test cả 2 chế độ AUTO và MANUAL với xe thật, không chỉ ở chế độ giả
-      lập.
-- [ ] Đã test lệnh Dừng (nắm tay / phím Space) hoạt động ngay lập tức.
-- [ ] Đã chuẩn bị phương án dự phòng: nếu Bluetooth lỗi tại chỗ, chuyển ngay
-      sang cáp USB (mục 3, Cách B).
-- [ ] Đã kiểm tra ánh sáng tại địa điểm demo thật (không chỉ trong phòng làm
-      việc quen thuộc).
+- [ ] Kê bánh xe khỏi mặt đất trong lần thử firmware đầu tiên.
+- [ ] Nút dừng MANUAL đưa cả hai PWM về 0.
+- [ ] Rút USB hoặc đóng tab làm xe dừng trong khoảng một giây.
+- [ ] Tắt ESP1 làm ESP2 tự dừng.
+- [ ] Đúng MAC Wi-Fi STA và đúng kênh 6.
+- [ ] UI hiển thị ESP-NOW khi đường chính tốt.
+- [ ] Tắt hoặc che sóng ESP-NOW để kiểm tra trạng thái Bluetooth dự phòng.
+- [ ] Thử đủ 8 hướng ở PWM thấp trước khi tăng tốc.
+- [ ] Kiểm tra ánh sáng và nền camera tại nơi thuyết trình.

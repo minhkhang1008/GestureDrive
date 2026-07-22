@@ -28,7 +28,7 @@ export function ModeToggle({
             role="tab"
             aria-selected={active}
             onClick={() => onChange(opt.value)}
-            className="relative px-4 py-1.5 text-[13px] font-semibold tracking-wide transition-colors"
+            className="relative px-2.5 py-1.5 text-[12px] font-semibold tracking-wide transition-transform active:scale-[0.97] sm:px-4 sm:text-[13px]"
           >
             {active && (
               <motion.span

@@ -1,21 +1,30 @@
 import {
   Hand,
   Bluetooth,
+  Broadcast,
   VideoCamera,
   Plugs,
   CircleNotch,
+  Warning,
 } from "@phosphor-icons/react";
 import { ModeToggle, type Mode } from "./ModeToggle";
 import type { SerialLink } from "../hooks/useSerialConnection";
 import type { TrackingStatus } from "../hooks/useHandTracking";
 
 function ConnectionStatus({ link }: { link: SerialLink }) {
-  if (link.status === "connected" || link.status === "demo") {
-    const label = link.status === "demo" ? "Giả lập" : "ESP32";
+  if (link.status === "connected") {
+    const state =
+      link.transport === "esp-now"
+        ? { label: "ESP-NOW", icon: <Broadcast size={13} />, color: "text-ok" }
+        : link.transport === "bluetooth"
+          ? { label: "Bluetooth", icon: <Bluetooth size={13} />, color: "text-accent" }
+          : link.transport === "none"
+            ? { label: "Mất ESP2", icon: <Warning size={13} />, color: "text-stop" }
+            : { label: "Đang dò ESP2", icon: <CircleNotch size={13} />, color: "text-dim" };
     return (
       <div className="hidden items-center gap-2 rounded-full border border-line bg-surface-2 px-3 py-1.5 sm:flex">
-        <span className="size-2 rounded-full bg-ok shadow-[0_0_8px_var(--color-ok)]" />
-        <span className="text-[12px] font-medium text-ink">{label}</span>
+        <span className={state.color}>{state.icon}</span>
+        <span className="text-[12px] font-medium text-ink">{state.label}</span>
         <span className="hidden font-mono text-[11px] text-faint md:inline">
           {link.portName}
         </span>
@@ -46,19 +55,19 @@ export function TopBar({
   fps: number;
   trackingStatus: TrackingStatus;
 }) {
-  const isLinked = link.status === "connected" || link.status === "demo";
+  const isLinked = link.status === "connected";
 
   return (
-    <header className="flex h-16 shrink-0 items-center gap-2 border-b border-line px-4 sm:gap-4 sm:px-5">
+    <header className="flex h-16 shrink-0 items-center gap-1.5 border-b border-line px-3 sm:gap-4 sm:px-5">
       <div className="flex items-center gap-2.5">
         <span className="grid size-8 place-items-center rounded-[10px] border border-accent/40 bg-accent/10 text-accent">
           <Hand size={18} weight="bold" />
         </span>
         <div className="flex items-baseline gap-2">
-          <span className="text-[15px] font-semibold tracking-tight text-ink">
+          <span className="hidden text-[15px] font-semibold tracking-tight text-ink min-[430px]:inline">
             GestureDrive
           </span>
-          <span className="hidden text-[12px] text-faint sm:inline">
+          <span className="hidden text-[12px] text-faint lg:inline">
             Điều khiển Micromouse
           </span>
         </div>
@@ -77,7 +86,7 @@ export function TopBar({
         {isLinked ? (
           <button
             onClick={() => void link.disconnect()}
-            className="flex items-center gap-1.5 rounded-[var(--radius-control)] border border-line px-3 py-1.5 text-[13px] font-medium text-dim transition-colors hover:border-line-strong hover:text-ink"
+            className="flex items-center gap-1.5 rounded-[var(--radius-control)] border border-line px-3 py-1.5 text-[13px] font-medium text-dim transition-[color,border-color,transform] hover:border-line-strong hover:text-ink active:scale-[0.97]"
           >
             <Plugs size={15} />
             <span className="hidden sm:inline">Ngắt</span>
@@ -86,10 +95,10 @@ export function TopBar({
           <button
             onClick={() => void link.connect()}
             disabled={link.status === "connecting"}
-            className="flex items-center gap-1.5 rounded-[var(--radius-control)] bg-accent-strong px-3.5 py-1.5 text-[13px] font-semibold text-white transition-[filter] hover:brightness-110 disabled:opacity-60"
+            className="flex items-center gap-1.5 rounded-[var(--radius-control)] bg-accent-strong px-3.5 py-1.5 text-[13px] font-semibold text-white transition-[filter,transform] hover:brightness-110 active:scale-[0.97] disabled:opacity-60"
           >
-            <Bluetooth size={15} weight="bold" />
-            <span className="hidden sm:inline">Kết nối ESP32</span>
+            <Broadcast size={15} weight="bold" />
+            <span className="hidden sm:inline">Kết nối ESP1</span>
             <span className="sm:hidden">Kết nối</span>
           </button>
         )}

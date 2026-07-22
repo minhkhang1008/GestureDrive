@@ -1,90 +1,204 @@
-import type { CommandCode } from "./commands";
+import type { DirectionCode } from "./commands";
 
-// A single MediaPipe hand landmark (normalized 0..1, origin top-left, x grows right).
+// A MediaPipe hand landmark. Coordinates are normalized to 0..1.
 export interface Landmark {
   x: number;
   y: number;
   z: number;
 }
 
-// Landmark indices per MediaPipe Hands topology.
-const TIP = { thumb: 4, index: 8, middle: 12, ring: 16, pinky: 20 };
-const PIP = { index: 6, middle: 10, ring: 14, pinky: 18 };
-const MCP = { thumb: 2, index: 5 };
+export type Handedness = "Left" | "Right";
+export type ScreenSide = "left" | "right";
+export type SetupPose = "open" | "fist" | "other";
+export type SpeedGestureState = "adjusting" | "locked" | "invalid";
+
+export interface Point {
+  x: number;
+  y: number;
+}
+
+export interface DirectionResult {
+  code: DirectionCode | null;
+  name: string;
+  orientationValid: boolean;
+}
+
+export interface SpeedGestureResult {
+  state: SpeedGestureState;
+  value: number | null;
+  fingers: boolean[];
+}
+
 const WRIST = 0;
+const MCP = { thumb: 2, index: 5, middle: 9, ring: 13, pinky: 17 };
+const PIP = { index: 6, middle: 10, ring: 14, pinky: 18 };
+const DIP = { index: 7, middle: 11, ring: 15, pinky: 19 };
+const TIP = { thumb: 4, index: 8, middle: 12, ring: 16, pinky: 20 };
 
-/**
- * Which fingers are extended: [thumb, index, middle, ring, pinky].
- * Fingers use the tip-above-pip test (screen y grows downward).
- * Thumb uses a sideways test relative to the hand's own axis so it works
- * for either hand and rotation.
- */
-export function fingersUp(lm: Landmark[], handedness: "Left" | "Right"): boolean[] {
-  const index = lm[TIP.index].y < lm[PIP.index].y;
-  const middle = lm[TIP.middle].y < lm[PIP.middle].y;
-  const ring = lm[TIP.ring].y < lm[PIP.ring].y;
-  const pinky = lm[TIP.pinky].y < lm[PIP.pinky].y;
+// Small enough to ignore tremor without making the joystick feel sluggish.
+export const DIRECTION_DEAD_ZONE = 0.035;
+export const SPEED_TOP = 0.14;
+export const SPEED_BOTTOM = 0.86;
 
-  // Thumb points outward horizontally. On a mirrored selfie view the sign of
-  // "outward" flips with handedness.
-  const thumbTip = lm[TIP.thumb];
-  const thumbMcp = lm[MCP.thumb];
+function distance(a: Landmark, b: Landmark): number {
+  return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+function jointAngle(a: Landmark, b: Landmark, c: Landmark): number {
+  const ab = { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
+  const cb = { x: c.x - b.x, y: c.y - b.y, z: c.z - b.z };
+  const dot = ab.x * cb.x + ab.y * cb.y + ab.z * cb.z;
+  const lengths = Math.hypot(ab.x, ab.y, ab.z) * Math.hypot(cb.x, cb.y, cb.z);
+  if (lengths === 0) return 0;
+  return (Math.acos(Math.min(1, Math.max(-1, dot / lengths))) * 180) / Math.PI;
+}
+
+function fingerExtended(
+  lm: Landmark[],
+  mcp: number,
+  pip: number,
+  dip: number,
+  tip: number,
+): boolean {
+  return (
+    jointAngle(lm[mcp], lm[pip], lm[dip]) > 150 &&
+    jointAngle(lm[pip], lm[dip], lm[tip]) > 145 &&
+    distance(lm[tip], lm[WRIST]) > distance(lm[pip], lm[WRIST]) * 1.08
+  );
+}
+
+/** Rotation-resistant finger state: [thumb, index, middle, ring, pinky]. */
+export function fingersUp(lm: Landmark[], _handedness: Handedness): boolean[] {
   const thumb =
-    handedness === "Right"
-      ? thumbTip.x < thumbMcp.x
-      : thumbTip.x > thumbMcp.x;
-
+    jointAngle(lm[MCP.thumb], lm[3], lm[TIP.thumb]) > 145 &&
+    distance(lm[TIP.thumb], lm[MCP.index]) > distance(lm[3], lm[MCP.index]) * 1.08;
+  const index = fingerExtended(lm, MCP.index, PIP.index, DIP.index, TIP.index);
+  const middle = fingerExtended(lm, MCP.middle, PIP.middle, DIP.middle, TIP.middle);
+  const ring = fingerExtended(lm, MCP.ring, PIP.ring, DIP.ring, TIP.ring);
+  const pinky = fingerExtended(lm, MCP.pinky, PIP.pinky, DIP.pinky, TIP.pinky);
   return [thumb, index, middle, ring, pinky];
 }
 
-export interface GestureResult {
-  code: CommandCode | null;
-  fingers: boolean[];
-  name: string;
+export function recognizeSetupPose(
+  lm: Landmark[],
+  handedness: Handedness,
+): SetupPose {
+  const [, index, middle, ring, pinky] = fingersUp(lm, handedness);
+  const longFingerCount = [index, middle, ring, pinky].filter(Boolean).length;
+  // Ignore the thumb during role setup. Its state is much more sensitive to
+  // camera angle, while the four long fingers clearly distinguish open/fist.
+  if (longFingerCount === 4) return "open";
+  if (longFingerCount === 0) return "fist";
+  return "other";
+}
+
+/** Point is returned in the mirrored, user-facing camera coordinate system. */
+export function palmCenter(lm: Landmark[]): Point {
+  const indices = [WRIST, MCP.index, MCP.middle, MCP.ring, MCP.pinky];
+  const raw = indices.reduce(
+    (sum, index) => ({ x: sum.x + lm[index].x, y: sum.y + lm[index].y }),
+    { x: 0, y: 0 },
+  );
+  return { x: 1 - raw.x / indices.length, y: raw.y / indices.length };
+}
+
+export function screenSide(point: Point): ScreenSide {
+  return point.x < 0.5 ? "left" : "right";
 }
 
 /**
- * Map a hand pose to one command character.
- * This scheme is intentionally simple and swappable. Agree the final mapping
- * with the AI recognition team; only the body of this function needs to change.
+ * Determine whether the palm, rather than the back of the hand, faces the
+ * camera. MediaPipe handedness is evaluated on the unmirrored input frame.
  */
-export function recognizeGesture(
+export function palmFacesCamera(lm: Landmark[], handedness: Handedness): boolean {
+  return handedness === "Right"
+    ? lm[MCP.index].x < lm[MCP.pinky].x
+    : lm[MCP.index].x > lm[MCP.pinky].x;
+}
+
+function sectorFromVector(dx: number, dy: number): DirectionCode {
+  const angle = (Math.atan2(dy, dx) * 180) / Math.PI;
+  if (angle >= -22.5 && angle < 22.5) return "R";
+  if (angle >= 22.5 && angle < 67.5) return "BR";
+  if (angle >= 67.5 && angle < 112.5) return "B";
+  if (angle >= 112.5 && angle < 157.5) return "BL";
+  if (angle >= 157.5 || angle < -157.5) return "L";
+  if (angle >= -157.5 && angle < -112.5) return "FL";
+  if (angle >= -112.5 && angle < -67.5) return "F";
+  return "FR";
+}
+
+const DIRECTION_NAMES: Record<DirectionCode, string> = {
+  F: "Đi thẳng",
+  B: "Đi lùi",
+  L: "Quay trái",
+  R: "Quay phải",
+  FL: "Chếch trái",
+  FR: "Chếch phải",
+  BL: "Lùi chếch trái",
+  BR: "Lùi chếch phải",
+  S: "Vùng dừng",
+};
+
+export function recognizeDirection(
   lm: Landmark[],
-  handedness: "Left" | "Right",
-): GestureResult {
-  const fingers = fingersUp(lm, handedness);
-  const count = fingers.filter(Boolean).length;
-  const [, index, middle, ring, pinky] = fingers;
-
-  // Fist -> Stop
-  if (count === 0) return { code: "S", fingers, name: "Nắm tay" };
-
-  // Open palm -> Forward
-  if (count === 5) return { code: "F", fingers, name: "Xòe bàn tay" };
-
-  // Four fingers, thumb tucked -> Backward
-  if (index && middle && ring && pinky && count === 4)
-    return { code: "B", fingers, name: "Bốn ngón" };
-
-  // Index only -> turn, direction from where the finger points.
-  if (index && !middle && !ring && !pinky) {
-    const dx = lm[TIP.index].x - lm[MCP.index].x;
-    if (dx < -0.04) return { code: "L", fingers, name: "Chỉ sang trái" };
-    if (dx > 0.04) return { code: "R", fingers, name: "Chỉ sang phải" };
-    return { code: null, fingers, name: "Ngón trỏ (giữ thẳng)" };
+  handedness: Handedness,
+  anchor: Point,
+): DirectionResult {
+  const center = palmCenter(lm);
+  const dx = center.x - anchor.x;
+  const dy = center.y - anchor.y;
+  if (Math.hypot(dx, dy) <= DIRECTION_DEAD_ZONE) {
+    return { code: "S", name: DIRECTION_NAMES.S, orientationValid: true };
   }
 
-  return { code: null, fingers, name: "Không rõ" };
+  const code = sectorFromVector(dx, dy);
+  const palmForward = palmFacesCamera(lm, handedness);
+  const upper = code === "F" || code === "FL" || code === "FR";
+  const lower = code === "B" || code === "BL" || code === "BR";
+  const orientationValid = (!upper || palmForward) && (!lower || !palmForward);
+
+  if (!orientationValid) {
+    return {
+      code: null,
+      name: upper ? "Hướng lòng bàn tay vào camera" : "Hướng mu bàn tay vào camera",
+      orientationValid: false,
+    };
+  }
+
+  return { code, name: DIRECTION_NAMES[code], orientationValid: true };
 }
 
-// Convenience: hand size in normalized units, used to scale overlay strokes.
+function speedFromY(y: number): number {
+  const normalized = (SPEED_BOTTOM - y) / (SPEED_BOTTOM - SPEED_TOP);
+  return Math.round(Math.min(1, Math.max(0, normalized)) * 255);
+}
+
+export function recognizeSpeedGesture(
+  lm: Landmark[],
+  handedness: Handedness,
+): SpeedGestureResult {
+  const fingers = fingersUp(lm, handedness);
+  const [thumb, index, middle, ring, pinky] = fingers;
+  const otherFingersTucked = !middle && !ring && !pinky;
+
+  if (thumb && index && otherFingersTucked) {
+    return {
+      state: "adjusting",
+      value: speedFromY(lm[TIP.index].y),
+      fingers,
+    };
+  }
+  if (!thumb && index && otherFingersTucked) {
+    return { state: "locked", value: null, fingers };
+  }
+  return { state: "invalid", value: null, fingers };
+}
+
 export function handSpan(lm: Landmark[]): number {
-  const w = lm[WRIST];
-  const m = lm[TIP.middle];
-  return Math.hypot(w.x - m.x, w.y - m.y);
+  return distance(lm[WRIST], lm[TIP.middle]);
 }
 
-// MediaPipe hand connections for drawing the skeleton.
 export const HAND_CONNECTIONS: [number, number][] = [
   [0, 1], [1, 2], [2, 3], [3, 4],
   [0, 5], [5, 6], [6, 7], [7, 8],

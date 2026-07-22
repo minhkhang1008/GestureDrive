@@ -3,16 +3,24 @@ import {
   ArrowDown,
   ArrowLeft,
   ArrowRight,
+  ArrowUpLeft,
+  ArrowUpRight,
+  ArrowDownLeft,
+  ArrowDownRight,
   HandPalm,
   type Icon,
 } from "@phosphor-icons/react";
-import type { CommandCode } from "../lib/commands";
+import type { DirectionCode } from "../lib/commands";
 
-const ICONS: Record<CommandCode, Icon> = {
+const ICONS: Record<DirectionCode, Icon> = {
   F: ArrowUp,
   B: ArrowDown,
   L: ArrowLeft,
   R: ArrowRight,
+  FL: ArrowUpLeft,
+  FR: ArrowUpRight,
+  BL: ArrowDownLeft,
+  BR: ArrowDownRight,
   S: HandPalm,
 };
 
@@ -21,7 +29,7 @@ export function CommandGlyph({
   size = 24,
   weight = "bold",
 }: {
-  code: CommandCode;
+  code: DirectionCode;
   size?: number;
   weight?: "regular" | "bold" | "fill";
 }) {

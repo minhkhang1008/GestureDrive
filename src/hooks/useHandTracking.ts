@@ -3,12 +3,27 @@ import type {
   HandLandmarker,
   HandLandmarkerResult,
 } from "@mediapipe/tasks-vision";
-import type { CommandCode } from "../lib/commands";
+import {
+  createDriveCommand,
+  sameDriveCommand,
+  STOP_COMMAND,
+  type DirectionCode,
+  type DriveCommand,
+} from "../lib/commands";
 import {
   HAND_CONNECTIONS,
+  DIRECTION_DEAD_ZONE,
   handSpan,
-  recognizeGesture,
+  palmCenter,
+  recognizeDirection,
+  recognizeSetupPose,
+  recognizeSpeedGesture,
+  screenSide,
+  type Handedness,
   type Landmark,
+  type Point,
+  type ScreenSide,
+  type SpeedGestureState,
 } from "../lib/gestureRecognition";
 
 export type TrackingStatus =
@@ -19,15 +34,37 @@ export type TrackingStatus =
   | "denied"
   | "error";
 
+export type SetupStatus = "waiting" | "calibrating" | "ready";
+
+export interface HandRoles {
+  control: ScreenSide;
+  speed: ScreenSide;
+}
+
 export interface LiveGesture {
-  code: CommandCode | null;
+  code: DirectionCode | null;
   name: string;
-  confidence: number; // 0..1 stability of the current reading
+  confidence: number;
+  speed: number;
+  speedLocked: boolean;
+  speedState: SpeedGestureState;
+  roles: HandRoles | null;
+  setupStatus: SetupStatus;
+  orientationValid: boolean;
+  handCount: number;
+  controlAnchor: Point | null;
 }
 
 interface Options {
-  onStableCommand: (code: CommandCode) => void;
+  onControlUpdate: (command: DriveCommand) => void;
   stableFrames?: number;
+}
+
+interface DetectedHand {
+  landmarks: Landmark[];
+  handedness: Handedness;
+  center: Point;
+  side: ScreenSide;
 }
 
 const WASM_URL =
@@ -37,37 +74,77 @@ const MODEL_URL =
 
 const ACCENT = "#3b82f6";
 const JOINT = "#dbeafe";
+const SETUP_STABLE_FRAMES = 8;
+const SPEED_DEADBAND = 4;
+const ROLE_RESET_MS = 800;
 
-export function useHandTracking({ onStableCommand, stableFrames = 4 }: Options) {
+const EMPTY_LIVE: LiveGesture = {
+  code: null,
+  name: "Đặt hai tay ở hai bên khung hình",
+  confidence: 0,
+  speed: 0,
+  speedLocked: true,
+  speedState: "invalid",
+  roles: null,
+  setupStatus: "waiting",
+  orientationValid: true,
+  handCount: 0,
+  controlAnchor: null,
+};
+
+export function useHandTracking({ onControlUpdate, stableFrames = 4 }: Options) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const [status, setStatus] = useState<TrackingStatus>("idle");
   const [error, setError] = useState<string | null>(null);
   const [handPresent, setHandPresent] = useState(false);
+  const [bothHandsPresent, setBothHandsPresent] = useState(false);
   const [fps, setFps] = useState(0);
-  const [live, setLive] = useState<LiveGesture>({
-    code: null,
-    name: "Chưa có tín hiệu",
-    confidence: 0,
-  });
+  const [live, setLive] = useState<LiveGesture>(EMPTY_LIVE);
 
   const landmarkerRef = useRef<HandLandmarker | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number | null>(null);
   const runningRef = useRef(false);
+  const onControlRef = useRef(onControlUpdate);
 
-  // Stale-closure guard: always call the latest callback.
-  const onStableRef = useRef(onStableCommand);
-  useEffect(() => {
-    onStableRef.current = onStableCommand;
-  }, [onStableCommand]);
-
-  // Rolling window of recent per-frame codes for stability + confidence.
-  const historyRef = useRef<(CommandCode | null)[]>([]);
-  const emittedRef = useRef<CommandCode | null>(null);
+  const rolesRef = useRef<HandRoles | null>(null);
+  const controlAnchorRef = useRef<Point | null>(null);
+  const setupHistoryRef = useRef<string[]>([]);
+  const directionHistoryRef = useRef<DirectionCode[]>([]);
+  const stableDirectionRef = useRef<DirectionCode>("S");
+  const speedRef = useRef(0);
+  const speedLockedRef = useRef(true);
+  const emittedRef = useRef<DriveCommand | null>(null);
+  const bothMissingSinceRef = useRef<number | null>(null);
   const lastTsRef = useRef(0);
   const frameTimesRef = useRef<number[]>([]);
+
+  useEffect(() => {
+    onControlRef.current = onControlUpdate;
+  }, [onControlUpdate]);
+
+  const emit = useCallback((command: DriveCommand) => {
+    if (sameDriveCommand(emittedRef.current, command)) return;
+    emittedRef.current = command;
+    onControlRef.current(command);
+  }, []);
+
+  const resetRoles = useCallback((emitStop: boolean) => {
+    rolesRef.current = null;
+    controlAnchorRef.current = null;
+    setupHistoryRef.current = [];
+    directionHistoryRef.current = [];
+    stableDirectionRef.current = "S";
+    speedRef.current = 0;
+    speedLockedRef.current = true;
+    bothMissingSinceRef.current = null;
+    emittedRef.current = null;
+    setBothHandsPresent(false);
+    setLive(EMPTY_LIVE);
+    if (emitStop) emit(STOP_COMMAND);
+  }, [emit]);
 
   const drawOverlay = useCallback((result: HandLandmarkerResult) => {
     const canvas = canvasRef.current;
@@ -80,20 +157,17 @@ export function useHandTracking({ onStableCommand, stableFrames = 4 }: Options) 
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    const hands = result.landmarks;
-    if (!hands.length) return;
+    if (!result.landmarks.length) return;
 
-    // Mirror to match the CSS-flipped video.
     ctx.save();
     ctx.translate(canvas.width, 0);
     ctx.scale(-1, 1);
 
-    for (const lm of hands as Landmark[][]) {
+    for (const lm of result.landmarks as Landmark[][]) {
       const span = handSpan(lm);
-      const w = Math.max(2, span * canvas.width * 0.02);
-
+      const width = Math.max(2, span * canvas.width * 0.02);
       ctx.strokeStyle = ACCENT;
-      ctx.lineWidth = w;
+      ctx.lineWidth = width;
       ctx.lineCap = "round";
       ctx.globalAlpha = 0.9;
       for (const [a, b] of HAND_CONNECTIONS) {
@@ -104,15 +178,187 @@ export function useHandTracking({ onStableCommand, stableFrames = 4 }: Options) 
       }
       ctx.globalAlpha = 1;
       ctx.fillStyle = JOINT;
-      for (let i = 0; i < lm.length; i++) {
-        const r = i === 0 ? w * 1.6 : w * 1.1;
+      for (let i = 0; i < lm.length; i += 1) {
+        const radius = i === 0 ? width * 1.6 : width * 1.1;
         ctx.beginPath();
-        ctx.arc(lm[i].x * canvas.width, lm[i].y * canvas.height, r, 0, Math.PI * 2);
+        ctx.arc(lm[i].x * canvas.width, lm[i].y * canvas.height, radius, 0, Math.PI * 2);
         ctx.fill();
       }
     }
     ctx.restore();
   }, []);
+
+  const toDetectedHands = useCallback((result: HandLandmarkerResult): DetectedHand[] => {
+    return (result.landmarks as Landmark[][]).map((landmarks, index) => {
+      const handedness =
+        (result.handedness?.[index]?.[0]?.categoryName as Handedness) ?? "Right";
+      const center = palmCenter(landmarks);
+      return { landmarks, handedness, center, side: screenSide(center) };
+    });
+  }, []);
+
+  const processHands = useCallback((result: HandLandmarkerResult, now: number) => {
+    const hands = toDetectedHands(result);
+    const hasHands = hands.length > 0;
+    setHandPresent(hasHands);
+
+    if (!hasHands) {
+      if (bothMissingSinceRef.current === null) bothMissingSinceRef.current = now;
+      if (rolesRef.current && now - bothMissingSinceRef.current >= ROLE_RESET_MS) {
+        resetRoles(true);
+        return;
+      }
+    } else {
+      bothMissingSinceRef.current = null;
+    }
+
+    const left = hands.find((hand) => hand.side === "left");
+    const right = hands.find((hand) => hand.side === "right");
+    const splitHands = left && right ? { left, right } : null;
+    const roles = rolesRef.current;
+
+    if (!roles) {
+      setBothHandsPresent(false);
+      let name = "Đặt hai tay ở hai bên khung hình";
+      let setupStatus: SetupStatus = "waiting";
+
+      if (splitHands) {
+        const leftPose = recognizeSetupPose(
+          splitHands.left.landmarks,
+          splitHands.left.handedness,
+        );
+        const rightPose = recognizeSetupPose(
+          splitHands.right.landmarks,
+          splitHands.right.handedness,
+        );
+        const validPair =
+          (leftPose === "open" && rightPose === "fist") ||
+          (leftPose === "fist" && rightPose === "open");
+
+        if (validPair) {
+          const control: ScreenSide = leftPose === "open" ? "left" : "right";
+          const speed: ScreenSide = control === "left" ? "right" : "left";
+          const key = `${control}:${speed}`;
+          const history = setupHistoryRef.current;
+          history.push(key);
+          if (history.length > SETUP_STABLE_FRAMES) history.shift();
+          const stable =
+            history.length === SETUP_STABLE_FRAMES && history.every((item) => item === key);
+
+          setupStatus = "calibrating";
+          name = "Giữ nguyên để xác nhận vai trò hai tay";
+          if (stable) {
+            const nextRoles = { control, speed };
+            const controlHand = splitHands[control];
+            rolesRef.current = nextRoles;
+            controlAnchorRef.current = controlHand.center;
+            stableDirectionRef.current = "S";
+            directionHistoryRef.current = [];
+            speedRef.current = 0;
+            speedLockedRef.current = true;
+            setBothHandsPresent(true);
+            const stop = createDriveCommand("S", 0, true);
+            emit(stop);
+            setLive({
+              ...EMPTY_LIVE,
+              code: "S",
+              name: "Đã xác nhận. Di chuyển tay điều hướng",
+              roles: nextRoles,
+              setupStatus: "ready",
+              handCount: hands.length,
+              controlAnchor: controlHand.center,
+              speedState: "locked",
+            });
+            return;
+          }
+        } else {
+          setupHistoryRef.current = [];
+          name = "Xòe tay điều hướng, nắm tay tốc độ";
+        }
+      } else {
+        setupHistoryRef.current = [];
+      }
+
+      setLive({
+        ...EMPTY_LIVE,
+        name,
+        setupStatus,
+        handCount: hands.length,
+      });
+      return;
+    }
+
+    const controlHand = splitHands?.[roles.control];
+    const speedHand = splitHands?.[roles.speed];
+    const pairReady = Boolean(controlHand && speedHand);
+    setBothHandsPresent(pairReady);
+
+    if (!controlHand || !speedHand || !controlAnchorRef.current) {
+      directionHistoryRef.current = [];
+      stableDirectionRef.current = "S";
+      emit(STOP_COMMAND);
+      setLive({
+        ...EMPTY_LIVE,
+        code: "S",
+        name: "Cần thấy đủ hai tay để tiếp tục",
+        speed: speedRef.current,
+        speedLocked: speedLockedRef.current,
+        roles,
+        setupStatus: "ready",
+        handCount: hands.length,
+        controlAnchor: controlAnchorRef.current,
+      });
+      return;
+    }
+
+    const direction = recognizeDirection(
+      controlHand.landmarks,
+      controlHand.handedness,
+      controlAnchorRef.current,
+    );
+    const rawCode = direction.code ?? "S";
+    const history = directionHistoryRef.current;
+    history.push(rawCode);
+    if (history.length > 12) history.shift();
+    const confidence = history.filter((code) => code === rawCode).length / history.length;
+
+    if (history.length >= stableFrames) {
+      const tail = history.slice(-stableFrames);
+      if (tail.every((code) => code === rawCode)) stableDirectionRef.current = rawCode;
+    }
+
+    const speedGesture = recognizeSpeedGesture(speedHand.landmarks, speedHand.handedness);
+    if (
+      speedGesture.state === "adjusting" &&
+      speedGesture.value !== null &&
+      Math.abs(speedGesture.value - speedRef.current) >= SPEED_DEADBAND
+    ) {
+      speedRef.current = speedGesture.value;
+    }
+    if (speedGesture.state === "adjusting") speedLockedRef.current = false;
+    if (speedGesture.state === "locked") speedLockedRef.current = true;
+
+    const command = createDriveCommand(
+      stableDirectionRef.current,
+      speedRef.current,
+      speedLockedRef.current,
+    );
+    emit(command);
+
+    setLive({
+      code: direction.code,
+      name: direction.name,
+      confidence,
+      speed: speedRef.current,
+      speedLocked: speedLockedRef.current,
+      speedState: speedGesture.state,
+      roles,
+      setupStatus: "ready",
+      orientationValid: direction.orientationValid,
+      handCount: hands.length,
+      controlAnchor: controlAnchorRef.current,
+    });
+  }, [emit, resetRoles, stableFrames, toDetectedHands]);
 
   const loop = useCallback(() => {
     const video = videoRef.current;
@@ -120,54 +366,21 @@ export function useHandTracking({ onStableCommand, stableFrames = 4 }: Options) 
     if (!runningRef.current || !video || !landmarker) return;
 
     if (video.readyState >= 2) {
-      let ts = performance.now();
-      if (ts <= lastTsRef.current) ts = lastTsRef.current + 1;
-      lastTsRef.current = ts;
-
-      const result = landmarker.detectForVideo(video, ts);
+      let timestamp = performance.now();
+      if (timestamp <= lastTsRef.current) timestamp = lastTsRef.current + 1;
+      lastTsRef.current = timestamp;
+      const result = landmarker.detectForVideo(video, timestamp);
       drawOverlay(result);
 
-      // fps over a 1s window
       const now = performance.now();
       const times = frameTimesRef.current;
       times.push(now);
       while (times.length && times[0] < now - 1000) times.shift();
       setFps(times.length);
-
-      const hand = result.landmarks[0] as Landmark[] | undefined;
-      const present = !!hand;
-      setHandPresent(present);
-
-      let code: CommandCode | null = null;
-      let name = "Không thấy bàn tay";
-      if (hand) {
-        const handedness =
-          (result.handedness?.[0]?.[0]?.categoryName as "Left" | "Right") ??
-          "Right";
-        const g = recognizeGesture(hand, handedness);
-        code = g.code;
-        name = g.name;
-      }
-
-      const hist = historyRef.current;
-      hist.push(code);
-      if (hist.length > 12) hist.shift();
-      const confidence = hist.length
-        ? hist.filter((c) => c === code).length / hist.length
-        : 0;
-      setLive({ code, name, confidence });
-
-      // Stable = same non-null code for the last `stableFrames` frames.
-      if (code && hist.length >= stableFrames) {
-        const tail = hist.slice(-stableFrames);
-        if (tail.every((c) => c === code) && emittedRef.current !== code) {
-          emittedRef.current = code;
-          onStableRef.current(code);
-        }
-      }
+      processHands(result, now);
     }
     rafRef.current = requestAnimationFrame(loop);
-  }, [drawOverlay, stableFrames]);
+  }, [drawOverlay, processHands]);
 
   const start = useCallback(async () => {
     if (runningRef.current) return;
@@ -175,7 +388,6 @@ export function useHandTracking({ onStableCommand, stableFrames = 4 }: Options) 
     setStatus("loading");
     try {
       if (!landmarkerRef.current) {
-        // Lazy-load the vision runtime (~500 kB) only when the camera starts.
         const { FilesetResolver, HandLandmarker } = await import(
           "@mediapipe/tasks-vision"
         );
@@ -183,7 +395,10 @@ export function useHandTracking({ onStableCommand, stableFrames = 4 }: Options) 
         landmarkerRef.current = await HandLandmarker.createFromOptions(vision, {
           baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
           runningMode: "VIDEO",
-          numHands: 1,
+          numHands: 2,
+          minHandDetectionConfidence: 0.55,
+          minHandPresenceConfidence: 0.55,
+          minTrackingConfidence: 0.55,
         });
       }
 
@@ -197,44 +412,44 @@ export function useHandTracking({ onStableCommand, stableFrames = 4 }: Options) 
       video.srcObject = stream;
       await video.play();
 
+      resetRoles(false);
       runningRef.current = true;
       setStatus("ready");
       rafRef.current = requestAnimationFrame(loop);
-    } catch (e) {
-      const err = e as DOMException;
-      if (err?.name === "NotAllowedError") {
+    } catch (reason) {
+      const cameraError = reason as DOMException;
+      if (cameraError?.name === "NotAllowedError") {
         setStatus("denied");
         setError("Bạn đã từ chối quyền camera. Hãy cấp quyền rồi thử lại.");
-      } else if (err?.name === "NotFoundError") {
+      } else if (cameraError?.name === "NotFoundError") {
         setStatus("no-camera");
         setError("Không tìm thấy camera nào trên máy này.");
       } else {
         setStatus("error");
-        setError(e instanceof Error ? e.message : String(e));
+        setError(reason instanceof Error ? reason.message : String(reason));
       }
     }
-  }, [loop]);
+  }, [loop, resetRoles]);
 
   const stop = useCallback(() => {
     runningRef.current = false;
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     rafRef.current = null;
-    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     const video = videoRef.current;
     if (video) video.srcObject = null;
-    historyRef.current = [];
-    emittedRef.current = null;
+    resetRoles(true);
     setHandPresent(false);
-    setLive({ code: null, name: "Đã tắt camera", confidence: 0 });
+    setFps(0);
     setStatus("idle");
-  }, []);
+  }, [resetRoles]);
 
   useEffect(() => {
     return () => {
       runningRef.current = false;
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-      streamRef.current?.getTracks().forEach((t) => t.stop());
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      streamRef.current?.getTracks().forEach((track) => track.stop());
       landmarkerRef.current?.close();
       landmarkerRef.current = null;
     };
@@ -246,8 +461,10 @@ export function useHandTracking({ onStableCommand, stableFrames = 4 }: Options) 
     status,
     error,
     handPresent,
+    bothHandsPresent,
     fps,
     live,
+    directionDeadZone: DIRECTION_DEAD_ZONE,
     start,
     stop,
   };

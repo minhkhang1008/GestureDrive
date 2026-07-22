@@ -1,8 +1,12 @@
-import { HandPalm } from "@phosphor-icons/react";
+import { Gauge, HandPalm } from "@phosphor-icons/react";
 import { CommandGlyph } from "./CommandGlyph";
-import { COMMANDS, type CommandCode } from "../lib/commands";
+import {
+  COMMAND_ORDER,
+  COMMANDS,
+  type DirectionCode,
+} from "../lib/commands";
 
-const KEY_HINT: Record<CommandCode, string> = {
+const KEY_HINT: Partial<Record<DirectionCode, string>> = {
   F: "W",
   B: "S",
   L: "A",
@@ -14,16 +18,12 @@ function PadKey({
   code,
   active,
   onPress,
-  className = "",
 }: {
-  code: CommandCode;
+  code: DirectionCode;
   active: boolean;
-  onPress: (c: CommandCode) => void;
-  className?: string;
+  onPress: (code: DirectionCode) => void;
 }) {
   const isStop = code === "S";
-  const base =
-    "group flex aspect-square flex-col items-center justify-center gap-1 rounded-[var(--radius-control)] border transition-all active:scale-[0.94] select-none";
   const palette = isStop
     ? active
       ? "border-stop/60 bg-stop/20 text-stop"
@@ -35,44 +35,73 @@ function PadKey({
   return (
     <button
       onPointerDown={() => onPress(code)}
-      aria-label={`${COMMANDS[code].label} (${KEY_HINT[code]})`}
-      className={`${base} ${palette} ${className}`}
+      aria-label={`${COMMANDS[code].label}${KEY_HINT[code] ? ` (${KEY_HINT[code]})` : ""}`}
+      className={`group flex aspect-square select-none flex-col items-center justify-center gap-0.5 rounded-[var(--radius-control)] border transition-all active:scale-[0.94] ${palette}`}
     >
       {isStop ? (
-        <HandPalm size={22} weight={active ? "fill" : "bold"} />
+        <HandPalm size={20} weight={active ? "fill" : "bold"} />
       ) : (
-        <CommandGlyph code={code} size={22} />
+        <CommandGlyph code={code} size={20} />
       )}
-      <span className="font-mono text-[10px] opacity-70">{KEY_HINT[code]}</span>
+      <span className="font-mono text-[9px] opacity-65">
+        {KEY_HINT[code] ?? code}
+      </span>
     </button>
   );
 }
 
 export function ManualPad({
   active,
+  speed,
+  onSpeedChange,
   onCommand,
 }: {
-  active: CommandCode | null;
-  onCommand: (c: CommandCode) => void;
+  active: DirectionCode | null;
+  speed: number;
+  onSpeedChange: (speed: number) => void;
+  onCommand: (code: DirectionCode) => void;
 }) {
   return (
     <div className="rounded-[var(--radius-panel)] border border-line bg-surface p-5">
-      <p className="mb-4 text-[12px] font-medium text-dim">Bàn phím điều khiển</p>
-
-      <div className="mx-auto grid max-w-[248px] grid-cols-3 gap-2">
-        <span />
-        <PadKey code="F" active={active === "F"} onPress={onCommand} />
-        <span />
-        <PadKey code="L" active={active === "L"} onPress={onCommand} />
-        <PadKey code="S" active={active === "S"} onPress={onCommand} />
-        <PadKey code="R" active={active === "R"} onPress={onCommand} />
-        <span />
-        <PadKey code="B" active={active === "B"} onPress={onCommand} />
-        <span />
+      <div className="mb-4 flex items-center justify-between">
+        <p className="text-[12px] font-medium text-dim">Điều khiển thủ công</p>
+        <span className="font-mono text-[11px] text-accent">PWM {speed}</span>
       </div>
 
-      <p className="mt-4 text-center text-[12px] text-faint">
-        Bấm nút hoặc dùng phím W A S D, Space để dừng.
+      <div className="grid grid-cols-[1fr_126px] gap-4">
+        <div className="grid grid-cols-3 gap-1.5">
+          {COMMAND_ORDER.map((code) => (
+            <PadKey
+              key={code}
+              code={code}
+              active={active === code}
+              onPress={onCommand}
+            />
+          ))}
+        </div>
+
+        <label className="flex flex-col justify-center gap-3 rounded-[var(--radius-control)] border border-line bg-surface-2 px-3 py-3">
+          <span className="flex items-center gap-1.5 text-[11px] text-dim">
+            <Gauge size={14} /> Tốc độ
+          </span>
+          <input
+            type="range"
+            min="0"
+            max="255"
+            step="5"
+            value={speed}
+            onChange={(event) => onSpeedChange(Number(event.target.value))}
+            className="w-full accent-accent"
+            aria-label="Tốc độ động cơ thủ công"
+          />
+          <span className="text-[10px] leading-snug text-faint">
+            Đổi tốc độ sẽ cập nhật hướng đang chạy.
+          </span>
+        </label>
+      </div>
+
+      <p className="mt-4 text-center text-[11px] text-faint">
+        W A S D cho bốn hướng chính, Space để dừng.
       </p>
     </div>
   );

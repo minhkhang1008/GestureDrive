@@ -1,11 +1,11 @@
 import { motion, AnimatePresence, useReducedMotion } from "motion/react";
 import { HandTap, Cursor, ClockCounterClockwise } from "@phosphor-icons/react";
-import { COMMANDS, type CommandCode } from "../lib/commands";
+import { COMMANDS, type DriveCommand } from "../lib/commands";
 import { CommandGlyph } from "./CommandGlyph";
 
 export interface LogEntry {
   id: number;
-  code: CommandCode;
+  command: DriveCommand;
   time: string;
   source: "gesture" | "manual";
 }
@@ -18,7 +18,7 @@ export function CommandLog({ entries }: { entries: LogEntry[] }) {
       <div className="mb-3 flex items-center justify-between">
         <p className="text-[12px] font-medium text-dim">Nhật ký lệnh</p>
         <span className="font-mono text-[11px] text-faint">
-          {entries.length} đã gửi
+          {entries.length} đã ghi nhận
         </span>
       </div>
 
@@ -26,15 +26,16 @@ export function CommandLog({ entries }: { entries: LogEntry[] }) {
         <div className="flex flex-1 flex-col items-center justify-center gap-2 py-6 text-center">
           <ClockCounterClockwise size={22} className="text-faint" />
           <p className="text-[12px] text-faint">
-            Chưa có lệnh nào được gửi tới xe.
+            Chưa có tín hiệu điều khiển nào.
           </p>
         </div>
       ) : (
         <div className="-mr-2 flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto pr-2">
           <AnimatePresence initial={false}>
             {entries.map((e) => {
-              const cmd = COMMANDS[e.code];
-              const isStop = e.code === "S";
+              const cmd = COMMANDS[e.command.code];
+              const isStop =
+                e.command.leftMotor === 0 && e.command.rightMotor === 0;
               return (
                 <motion.div
                   key={e.id}
@@ -52,10 +53,13 @@ export function CommandLog({ entries }: { entries: LogEntry[] }) {
                       isStop ? "bg-stop/15 text-stop" : "bg-accent/15 text-accent"
                     }`}
                   >
-                    <CommandGlyph code={e.code} size={13} />
+                    <CommandGlyph code={e.command.code} size={13} />
                   </span>
                   <span className="flex-1 text-[13px] font-medium text-ink">
                     {cmd.label}
+                  </span>
+                  <span className="font-mono text-[10px] text-dim">
+                    {e.command.speed}
                   </span>
                   <span
                     className="text-faint"
