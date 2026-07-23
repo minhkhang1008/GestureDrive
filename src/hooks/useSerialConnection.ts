@@ -55,6 +55,7 @@ export function useSerialConnection(): SerialLink {
   const writeQueueRef = useRef<Promise<void>>(Promise.resolve());
   const disconnectHandlerRef = useRef<(() => void) | null>(null);
   const encoderRef = useRef(new TextEncoder());
+  const lastSentUiUpdateRef = useRef(0);
 
   const supported = typeof navigator !== "undefined" && Boolean(navigator.serial);
 
@@ -73,11 +74,14 @@ export function useSerialConnection(): SerialLink {
       return;
     }
     if (event.kind === "radio-tx") {
+      setTransport("lora");
+    
       setBridge((current) => ({
         ...current,
         lastRadioSequence: event.sequence,
         radioError: null,
       }));
+    
       return;
     }
     if (event.kind === "radio-error") {
@@ -174,7 +178,15 @@ export function useSerialConnection(): SerialLink {
             }
             try {
               await writer.write(payload);
-              setLastSentSequence(sequence);
+
+              const now = performance.now();
+
+              // Serial vẫn gửi 20 Hz nhưng UI chỉ render lại tối đa 4 Hz.
+              if (now - lastSentUiUpdateRef.current >= 250) {
+                lastSentUiUpdateRef.current = now;
+                setLastSentSequence(sequence);
+              }
+
               resolve(sequence);
             } catch (reason) {
               if (!closingRef.current) {
@@ -210,6 +222,7 @@ export function useSerialConnection(): SerialLink {
       writerRef.current = writer;
       readerRef.current = reader;
       sequenceRef.current = 0;
+      lastSentUiUpdateRef.current = 0;
       setLastSentSequence(null);
       const info = port.getInfo();
       setPortName(

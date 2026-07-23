@@ -19,6 +19,7 @@ constexpr size_t HOST_LINE_CAPACITY = 96;
 constexpr size_t HOST_BYTES_PER_LOOP = 64;
 constexpr uint8_t RADIO_FAILURES_BEFORE_LINK_DOWN = 3;
 constexpr uint32_t RADIO_OPERATION_TIMEOUT_MS = 250;
+uint32_t nextStatusReportMs = 0;
 
 SX1262 radio = new Module(transmitter_pins::LORA_NSS,
                           transmitter_pins::LORA_DIO1,
@@ -41,6 +42,7 @@ bool radioReady = false;
 bool radioTxInProgress = false;
 bool linkReportedUp = false;
 uint8_t consecutiveRadioFailures = 0;
+uint8_t radioTxReportDivider = 0;
 uint32_t radioTxStartedMs = 0;
 uint32_t nextRadioTxMs = 0;
 int16_t radioStartState = RADIOLIB_ERR_NONE;
@@ -264,8 +266,15 @@ void finishRadioTransmit() {
 
   consecutiveRadioFailures = 0;
   setLinkReported(true);
-  Serial.print(F("RADIO_TX:"));
-  Serial.println(inFlightPacket.sequence);
+  // Radio vẫn phát ở 20 Hz, nhưng chỉ gửi log trạng thái về frontend ở 2 Hz.
+  radioTxReportDivider++;
+  
+  if (radioTxReportDivider >= 10U) {
+    radioTxReportDivider = 0;
+
+    Serial.print(F("RADIO_TX:"));
+    Serial.println(inFlightPacket.sequence);
+  }
 }
 
 void serviceRadio(uint32_t now) {
@@ -300,6 +309,17 @@ void serviceRadio(uint32_t now) {
   radioTxInProgress = true;
   radioTxStartedMs = now;
 }
+  void serviceStatusReport(uint32_t now) {
+  if (static_cast<int32_t>(now - nextStatusReportMs) < 0) {
+    return;
+  }
+
+  nextStatusReportMs = now + 1000;
+
+  Serial.println(linkReportedUp ? F("LINK:LORA") : F("LINK:NONE"));
+  Serial.println(hostTimedOut ? F("HOST_TIMEOUT:1")
+                              : F("HOST_TIMEOUT:0"));
+}
 
 void serviceHostTimeout(uint32_t now) {
   if (hostTimedOut || now - lastValidHostMs <= config::HOST_TIMEOUT_MS) return;
@@ -324,4 +344,5 @@ void loop() {
   readHostSerial();
   serviceHostTimeout(now);
   serviceRadio(now);
+  serviceStatusReport(now);
 }
