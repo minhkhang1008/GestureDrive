@@ -1,3 +1,9 @@
+import {
+  createDriveCommand,
+  createStopCommand,
+  type ControlCommand,
+} from "./controlTypes";
+
 export type DirectionCode =
   | "F"
   | "B"
@@ -22,169 +28,44 @@ export type Direction =
 
 export interface CommandDef {
   code: DirectionCode;
-  wireCode: number;
   label: string;
   english: string;
-  motor: string;
+  control: string;
   direction: Direction;
 }
 
-export interface DriveCommand {
-  code: DirectionCode;
-  speed: number;
-  leftMotor: number;
-  rightMotor: number;
-  speedLocked: boolean;
-}
-
 export const COMMANDS: Record<DirectionCode, CommandDef> = {
-  F: {
-    code: "F",
-    wireCode: 1,
-    label: "Đi thẳng",
-    english: "Forward",
-    motor: "Hai bánh tiến đều",
-    direction: "up",
-  },
-  B: {
-    code: "B",
-    wireCode: 2,
-    label: "Đi lùi",
-    english: "Backward",
-    motor: "Hai bánh lùi đều",
-    direction: "down",
-  },
-  L: {
-    code: "L",
-    wireCode: 3,
-    label: "Quay trái",
-    english: "Pivot left",
-    motor: "Bánh trái lùi, bánh phải tiến",
-    direction: "left",
-  },
-  R: {
-    code: "R",
-    wireCode: 4,
-    label: "Quay phải",
-    english: "Pivot right",
-    motor: "Bánh trái tiến, bánh phải lùi",
-    direction: "right",
-  },
-  FL: {
-    code: "FL",
-    wireCode: 5,
-    label: "Chếch trái",
-    english: "Forward left",
-    motor: "Bánh trái chậm, bánh phải nhanh",
-    direction: "up-left",
-  },
-  FR: {
-    code: "FR",
-    wireCode: 6,
-    label: "Chếch phải",
-    english: "Forward right",
-    motor: "Bánh trái nhanh, bánh phải chậm",
-    direction: "up-right",
-  },
-  BL: {
-    code: "BL",
-    wireCode: 7,
-    label: "Lùi chếch trái",
-    english: "Backward left",
-    motor: "Bánh trái lùi chậm, bánh phải lùi nhanh",
-    direction: "down-left",
-  },
-  BR: {
-    code: "BR",
-    wireCode: 8,
-    label: "Lùi chếch phải",
-    english: "Backward right",
-    motor: "Bánh trái lùi nhanh, bánh phải lùi chậm",
-    direction: "down-right",
-  },
-  S: {
-    code: "S",
-    wireCode: 0,
-    label: "Dừng",
-    english: "Stop",
-    motor: "Dừng cả hai động cơ",
-    direction: "stop",
-  },
+  F: { code: "F", label: "Đi thẳng", english: "Forward", control: "Throttle +100%", direction: "up" },
+  B: { code: "B", label: "Đi lùi", english: "Backward", control: "Throttle -100%", direction: "down" },
+  L: { code: "L", label: "Pivot trái", english: "Pivot left", control: "Steering +100%", direction: "left" },
+  R: { code: "R", label: "Pivot phải", english: "Pivot right", control: "Steering -100%", direction: "right" },
+  FL: { code: "FL", label: "Tiến trái", english: "Forward left", control: "Throttle +100%, steering +60%", direction: "up-left" },
+  FR: { code: "FR", label: "Tiến phải", english: "Forward right", control: "Throttle +100%, steering -60%", direction: "up-right" },
+  BL: { code: "BL", label: "Lùi trái", english: "Backward left", control: "Throttle -100%, steering +60%", direction: "down-left" },
+  BR: { code: "BR", label: "Lùi phải", english: "Backward right", control: "Throttle -100%, steering -60%", direction: "down-right" },
+  S: { code: "S", label: "Dừng", english: "Stop", control: "Throttle 0%, steering 0%", direction: "stop" },
 };
 
-export const COMMAND_ORDER: DirectionCode[] = [
-  "FL",
-  "F",
-  "FR",
-  "L",
-  "S",
-  "R",
-  "BL",
-  "B",
-  "BR",
-];
+export const COMMAND_ORDER: DirectionCode[] = ["FL", "F", "FR", "L", "S", "R", "BL", "B", "BR"];
 
-const TURN_RATIO = 0.45;
+const DIRECTION_CHANNELS: Record<DirectionCode, [number, number]> = {
+  S: [0, 0],
+  F: [1000, 0],
+  B: [-1000, 0],
+  L: [0, 1000],
+  R: [0, -1000],
+  FL: [1000, 600],
+  FR: [1000, -600],
+  BL: [-1000, 600],
+  BR: [-1000, -600],
+};
 
-function clampPwm(value: number): number {
-  return Math.round(Math.min(255, Math.max(0, value)));
-}
-
-export function createDriveCommand(
+export function createDirectionalDrive(
   code: DirectionCode,
-  requestedSpeed: number,
-  speedLocked: boolean,
-): DriveCommand {
-  const speed = clampPwm(requestedSpeed);
-  const slow = Math.round(speed * TURN_RATIO);
-
-  const motors: Record<DirectionCode, [number, number]> = {
-    S: [0, 0],
-    F: [speed, speed],
-    B: [-speed, -speed],
-    L: [-speed, speed],
-    R: [speed, -speed],
-    FL: [slow, speed],
-    FR: [speed, slow],
-    BL: [-slow, -speed],
-    BR: [-speed, -slow],
-  };
-
-  const [leftMotor, rightMotor] = motors[code];
-  return { code, speed, leftMotor, rightMotor, speedLocked };
-}
-
-export const STOP_COMMAND = createDriveCommand("S", 0, true);
-
-export function sameDriveCommand(
-  a: DriveCommand | null,
-  b: DriveCommand | null,
-): boolean {
-  if (!a || !b) return a === b;
-  return (
-    a.code === b.code &&
-    a.speed === b.speed &&
-    a.leftMotor === b.leftMotor &&
-    a.rightMotor === b.rightMotor &&
-    a.speedLocked === b.speedLocked
-  );
-}
-
-/**
- * USB protocol from the browser to ESP1.
- *
- * GD,sequence,leftMotor,rightMotor,speed,direction,flags\n
- * flags bit 0: the speed slider is locked.
- */
-export function toWireLine(command: DriveCommand, sequence: number): string {
-  const flags = command.speedLocked ? 1 : 0;
-  return [
-    "GD",
-    sequence & 0xffff,
-    command.leftMotor,
-    command.rightMotor,
-    command.speed,
-    COMMANDS[command.code].wireCode,
-    flags,
-  ].join(",") + "\n";
+  speedLimit: number,
+  speedLocked = true,
+): ControlCommand {
+  if (code === "S") return createStopCommand();
+  const [throttle, steering] = DIRECTION_CHANNELS[code];
+  return createDriveCommand(throttle, steering, speedLimit, { speedLocked });
 }

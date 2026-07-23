@@ -1,204 +1,153 @@
 # Hướng dẫn sử dụng GestureDrive
 
-Tài liệu này là hợp đồng chung cho nhóm AI, nhóm app và nhóm phần cứng.
+## 1. Chuẩn bị an toàn
 
-## 1. Chuẩn bị
+- Laptop có Chrome hoặc Edge desktop và Node.js 20+.
+- Hai ESP32-S3, hai SX1262 và antenna đúng dải tần.
+- Driver hai motor loại hai direction + một PWM mỗi motor, ví dụ TB6612FNG hoặc
+  L298N được đấu theo bảng trong `docs/HARDWARE_WIRING.md`.
+- Nguồn motor riêng đúng điện áp, mass nguồn motor và ESP2 nối chung.
+- Một công tắc ngắt nguồn motor vật lý trong tầm tay.
 
-- Chrome hoặc Edge trên máy tính.
-- Node.js 20 trở lên.
-- Hai ESP32 nguyên bản có Bluetooth Classic.
-- ESP1 đã nạp sketch `esp sketch/send/send/send.ino`.
-- ESP2 đã nạp sketch `esp sketch/receive/receive.ino`.
-- Đã điền đúng MAC Wi-Fi STA của ESP2 vào `receiverMac` trên ESP1.
-- Đã sửa chân motor trong sketch ESP2 theo mạch thật.
+Không phát radio khi chưa gắn antenna. Không đặt xe xuống sàn trong lần test đầu.
+Pin trong source là ví dụ và phải được xác nhận theo board thật.
 
-Ứng dụng không có chế độ giả lập. Khi chưa kết nối ESP1, camera vẫn có thể nhận
-dạng để kiểm tra thuật toán nhưng giao diện luôn báo chưa có đường truyền thật.
+## 2. Xác nhận config
 
-## 2. Khởi động
+Kiểm tra trước khi compile:
+
+- ESP1: `firmware/transmitter/BoardPins.h`.
+- ESP2: `firmware/receiver/BoardPins.h`.
+- Radio: `firmware/common/RadioConfig.h`.
+- Motor, mixer, ramp và timeout: `firmware/common/ConfigDefaults.h`.
+
+Hai radio phải có cùng frequency, bandwidth, SF, coding rate, sync word và
+preamble. `TCXO_VOLTAGE` phải đúng loại module.
+
+## 3. Tìm cổng serial
+
+- macOS: `ls /dev/cu.*`
+- Linux: `ls /dev/ttyUSB* /dev/ttyACM*`
+- Windows: mở Device Manager, mục Ports (COM & LPT).
+
+Rút rồi cắm lại board để xác định cổng vừa xuất hiện. Dùng cáp USB có dữ liệu,
+không dùng cáp chỉ sạc.
+
+### Cài RadioLib
+
+`pio run` sẽ tự tải đúng RadioLib 7.7.1 từ `platformio.ini`. Với Arduino IDE 2,
+mở Library Manager, tìm **RadioLib by Jan Gromes** và cài 7.7.1; trong Boards
+Manager cài **esp32 by Espressif Systems** 2.0.17. Firmware trong repo được
+compile xác nhận bằng PlatformIO, vì vậy đây là workflow khuyến nghị.
+
+## 4. Compile và nạp ESP2 trước
+
+Để nguồn motor đang tắt và bánh được kê khỏi mặt bàn:
+
+```bash
+pio run -e esp2_receiver
+pio run -e esp2_receiver -t upload --upload-port <ESP2_PORT>
+pio device monitor --port <ESP2_PORT> --baud 115200
+```
+
+Sau boot phải thấy `FAILSAFE:1`. Motor phải không quay và STANDBY phải ở mức
+disable. Nếu radio không khởi tạo, monitor báo `RADIO_ERROR:<code>`; không tiếp
+tục thử motor cho đến khi sửa wiring/config.
+
+## 5. Compile và nạp ESP1
+
+Gắn antenna cho cả hai radio:
+
+```bash
+pio run -e esp1_transmitter
+pio run -e esp1_transmitter -t upload --upload-port <ESP1_PORT>
+pio device monitor --port <ESP1_PORT> --baud 115200
+```
+
+ESP1 boot ở `HOST_TIMEOUT:1` và `LINK:NONE`. Khi nhận GD2 hợp lệ từ app, host
+timeout về 0. Sau khi SX1262 hoàn tất transmit, trạng thái chuyển `LINK:LORA`.
+
+## 6. Chạy frontend
 
 ```bash
 npm install
 npm run dev
 ```
 
-1. Mở địa chỉ Vite bằng Chrome hoặc Edge.
-2. Bật nguồn ESP2 trên xe.
-3. Cắm ESP1 vào laptop bằng cáp USB dữ liệu.
-4. Bấm **Kết nối ESP1**, chọn cổng CP210x hoặc CH340 tương ứng.
-5. Quan sát trạng thái trên thanh trên:
-   - **ESP-NOW**: đường chính đang hoạt động.
-   - **Bluetooth**: ESP1 đã tự chuyển sang đường dự phòng.
-   - **Mất ESP2**: USB tới ESP1 còn hoạt động nhưng chưa tới được xe.
-6. Bấm **Bật camera** và cấp quyền camera.
+1. Mở URL Vite bằng Chrome hoặc Edge.
+2. Bấm **Kết nối ESP1** và chọn đúng cổng.
+3. Kiểm tra `Serial = CONNECTED`, `LoRa = LORA`, `Host timeout = CLEAR`.
+4. Chuyển sang `CAL` cho buổi hiệu chỉnh đầu tiên.
 
-## 3. Xác nhận vai trò hai tay
+## 7. CALIBRATION
 
-Đặt một tay ở nửa trái và một tay ở nửa phải của khung camera. Hai tay không bắt
-buộc theo tay trái/tay phải sinh học.
+- Safety limit mặc định 60%, tương ứng packet tối đa `600`.
+- Hai slider đặt giá trị yêu cầu từ -100% đến +100%; giá trị packet bị giới hạn
+  theo safety limit.
+- Slider không tự chạy motor. Giữ **Giữ để áp dụng hai slider** mới gửi
+  `DIRECT_PWM`; thả, pointer cancel hoặc rời nút sẽ STOP.
+- Tám nút thử nhanh cũng chỉ chạy khi giữ.
+- Timed pulse chạy hai giá trị slider trong 250, 500, 1000 hoặc 2000 ms rồi
+  tự STOP.
+- W/S chạy hai bánh tiến/lùi; A/D pivot trái/phải. Keyup luôn STOP.
 
-1. Xòe tay muốn dùng để điều hướng.
-2. Nắm tay muốn dùng để điều khiển tốc độ.
-3. Giữ ổn định trong tám khung hình.
-4. Khi thành công, app hiện nhãn **TAY ĐIỀU HƯỚNG**, **TAY TỐC ĐỘ**, tâm joystick
-   và thanh tốc độ đúng bên.
+Space luôn STOP. Escape luôn gửi E-stop, bất kể mode.
 
-Quy ước cố định trong bản này:
+## 8. MANUAL
 
-- Tay xòe lúc xác nhận = tay điều hướng.
-- Tay nắm lúc xác nhận = tay tốc độ.
-
-Muốn đổi vai trò, đưa cả hai tay ra khỏi camera ít nhất 0,8 giây. App dừng xe,
-xóa hiệu chuẩn và chờ thao tác xòe - nắm mới.
-
-## 4. Điều hướng
-
-Tâm lòng bàn tay lúc xác nhận được lưu làm gốc joystick. Di chuyển tay quanh gốc
-để chọn một trong chín vùng:
-
-| Vị trí | Hướng |
-| --- | --- |
-| Tâm | Dừng |
-| Trên | Đi thẳng |
-| Trên trái | Chếch trái |
-| Trên phải | Chếch phải |
-| Trái | Quay tại chỗ sang trái |
-| Phải | Quay tại chỗ sang phải |
-| Dưới | Đi lùi |
-| Dưới trái | Lùi chếch trái |
-| Dưới phải | Lùi chếch phải |
-
-Ba hướng trên chỉ hợp lệ khi lòng bàn tay hướng vào camera. Ba hướng dưới chỉ
-hợp lệ khi mu bàn tay hướng vào camera. Nếu mặt tay chưa đúng, app hiển thị hướng
-dẫn và phát trạng thái dừng.
-
-Vùng dừng mặc định có bán kính `0.035` theo tọa độ chuẩn hóa camera. Bốn khung
-hình liên tiếp phải cùng một hướng trước khi hướng đó có hiệu lực. Hai lớp này
-loại rung tay nhưng vẫn giữ phản hồi nhanh.
-
-## 5. Điều khiển tốc độ
-
-Trên tay tốc độ:
-
-1. Thu ngón giữa, áp út và út.
-2. Duỗi ngón trỏ và ngón cái để mở khóa thanh kéo.
-3. Đưa ngón trỏ lên để tăng PWM, đưa xuống để giảm PWM.
-4. Thu ngón cái nhưng giữ ngón trỏ để khóa tốc độ hiện tại.
-
-Thanh tốc độ dùng khoảng dọc từ 14% tới 86% chiều cao camera và ánh xạ thành
-PWM 255 tới 0. Thay đổi nhỏ dưới 4 PWM bị bỏ qua để chống rung.
-
-Khóa tốc độ chỉ ngăn cập nhật thanh kéo. Tay điều hướng vẫn tiếp tục điều khiển
-xe bằng mức tốc độ đã giữ.
-
-## 6. Chế độ AUTO và MANUAL
-
-### AUTO
-
-- Nhận lệnh từ hai tay.
-- Thiếu một tay thì dừng sau 300 ms.
-- Cả hai tay rời khung 0,8 giây thì xóa vai trò.
-- App gửi heartbeat tới ESP1 mỗi 200 ms.
-
-### MANUAL
-
-Dùng để kiểm tra motor và căn vị trí xe. Bàn điều khiển có đủ 8 hướng, nút dừng
-và thanh PWM 0-255.
-
-- `W`: tiến.
-- `S`: lùi.
-- `A`: quay trái.
-- `D`: quay phải.
-- `Space`: dừng.
-
-Mỗi lần chuyển AUTO/MANUAL, app gửi dừng trước để lệnh từ chế độ cũ không tiếp
-tục chạy.
-
-## 7. Luồng ESP-NOW và Bluetooth dự phòng
-
-Laptop luôn nói chuyện với ESP1 qua USB Serial. Bluetooth không thay thế cáp
-laptop - ESP1, mà là đường dự phòng ESP1 - ESP2.
-
-ESP1 gửi gói điều khiển mỗi 100 ms:
-
-1. Mặc định gửi qua ESP-NOW Long Range.
-2. Sau ba callback gửi thất bại, nếu Bluetooth đã kết nối thì chuyển sang SPP.
-3. Khi đang dùng Bluetooth, ESP1 vẫn thử ESP-NOW mỗi giây.
-4. Sau ba lần ESP-NOW thành công liên tiếp, ESP1 tự quay lại đường chính.
-5. ESP1 in trạng thái `LINK:*` qua USB để app cập nhật giao diện.
-
-Cả hai ESP phải dùng `ESPNOW_CHANNEL = 6`. Nếu đổi kênh, sửa cùng giá trị trong
-cả hai sketch.
-
-## 8. Giao thức giữa ba nhóm
-
-### App tới ESP1
+MANUAL gửi `DRIVE`, vì vậy ESP2 thực hiện mixer:
 
 ```text
-GD,sequence,leftMotor,rightMotor,speed,direction,flags\n
+leftRaw  = throttle - K_TURN * steering
+rightRaw = throttle + K_TURN * steering
 ```
 
-| Trường | Miền giá trị | Ý nghĩa |
-| --- | --- | --- |
-| `sequence` | 0-65535 | Số thứ tự gói USB |
-| `leftMotor` | -255 đến 255 | Dấu là chiều quay, trị tuyệt đối là PWM |
-| `rightMotor` | -255 đến 255 | Dấu là chiều quay, trị tuyệt đối là PWM |
-| `speed` | 0-255 | Mức thanh tốc độ |
-| `direction` | 0-8 | Dừng, 8 hướng theo bảng dưới |
-| `flags` | bit field | Bit 0 bằng 1 khi tốc độ đã khóa |
+Nút hướng và W/A/S/D là dead-man. Nhấn giữ mới chạy; nhả sẽ STOP. Slider chung
+chỉ thay `speedLimit`.
 
-| Mã hướng | Giá trị |
-| --- | ---: |
-| Dừng | 0 |
-| Tiến | 1 |
-| Lùi | 2 |
-| Trái | 3 |
-| Phải | 4 |
-| Chếch trái | 5 |
-| Chếch phải | 6 |
-| Lùi chếch trái | 7 |
-| Lùi chếch phải | 8 |
+## 9. AUTO
 
-### ESP1 tới ESP2
+1. Bật camera.
+2. Xòe tay điều hướng và nắm tay tốc độ ở hai bên camera.
+3. Giữ tám frame để xác nhận role.
+4. Tay tốc độ dùng ngón trỏ + ngón cái để chỉnh và thu ngón cái để khóa limit.
+5. Thiếu tay điều hướng hoặc thiếu đủ hai tay sẽ STOP.
 
-`DrivePacket` dài 13 byte, có cùng trường motor, tốc độ, hướng và cờ. Gói thêm
-magic `0x4744`, version và checksum XOR. ESP-NOW và Bluetooth dùng đúng cùng một
-cấu trúc để tránh hai nhánh firmware xử lý khác nhau.
+AUTO hiện giữ sector 8 hướng để tương thích UI. Continuous gesture và role
+matching qua vị trí frame trước là P1, chưa dùng cho buổi calibration P0.
 
-## 9. Ba lớp dừng an toàn
+## 10. E-stop và reset
 
-| Lớp | Timeout | Tác dụng |
-| --- | ---: | --- |
-| App | 300 ms | Dừng khi không còn đủ hai tay |
-| ESP1 | 600 ms | Dừng khi tab bị treo, mất USB hoặc mất heartbeat |
-| ESP2 | 700 ms | Dừng khi mất cả ESP-NOW và Bluetooth |
+E-stop được latch ở browser và ESP2. Không đổi mode hoặc khôi phục serial nào tự
+clear được nó.
 
-Không tăng timeout nếu chưa kiểm tra quãng đường xe tiếp tục trôi ở tốc độ tối
-đa.
+1. Nhấn Escape hoặc nút đỏ E-STOP.
+2. Xử lý nguyên nhân, kê bánh và bảo đảm khu vực an toàn.
+3. Kết nối lại ESP1 nếu cần.
+4. Bấm **Arm / Reset**.
+5. App gửi ít nhất ba STOP disarmed, sau đó giữ packet reset nhiều chu kỳ radio.
+6. ESP2 chỉ clear latch khi đã thấy đúng trình tự; output vẫn bằng 0 sau reset.
+7. Phải thực hiện một dead-man action mới để xe chạy lại.
 
-## 10. Xử lý sự cố
+## 11. Tự dừng theo lifecycle
+
+App cố gửi STOP khi window blur, tab ẩn, pagehide, đổi mode hoặc mất serial. ESP1
+tự chuyển latest command thành STOP nếu không có dòng host hợp lệ trong 225 ms.
+ESP2 đưa PWM về 0 nếu không có packet radio mới hợp lệ trong 225 ms và hạ
+STANDBY sau 1000 ms.
+
+Xem bài test bắt buộc tại `docs/SAFETY_TESTS.md` trước khi đặt bánh xuống sàn.
+
+## 12. Xử lý sự cố
 
 | Hiện tượng | Kiểm tra |
 | --- | --- |
-| Không có nút chọn cổng | Dùng Chrome/Edge desktop, không dùng Safari/Firefox |
-| Không thấy ESP1 | Đổi cáp USB dữ liệu, cài driver CP210x/CH340 |
-| App báo mất ESP2 | Kiểm tra nguồn ESP2, MAC trong ESP1, kênh 6 và LR trên cả hai |
-| ESP-NOW luôn lỗi | Đảm bảo MAC lấy từ `WiFi.macAddress()` của ESP2, không dùng MAC Bluetooth |
-| Bluetooth không kết nối | Cả hai board phải là ESP32 nguyên bản, tên ESP2 phải là `GestureDrive-ESP2` |
-| Nhận sai vai trò | Đưa cả hai tay ra 0,8 giây, vào lại hai nửa màn hình và giữ xòe - nắm |
-| Không nhận hướng lùi | Quay mu bàn tay về camera trước khi kéo xuống |
-| Tốc độ không đổi | Chỉ duỗi ngón trỏ + cái, thu ba ngón còn lại |
-| Xe chạy ngược | Đổi dây motor hoặc đổi cặp `IN1/IN2` của bánh đó trong sketch |
-| Hai bánh lệch tốc độ | Hiệu chỉnh riêng PWM motor hoặc thay `TURN_RATIO` sau khi đo thực tế |
-
-## 11. Checklist trước khi chạy xe
-
-- [ ] Kê bánh xe khỏi mặt đất trong lần thử firmware đầu tiên.
-- [ ] Nút dừng MANUAL đưa cả hai PWM về 0.
-- [ ] Rút USB hoặc đóng tab làm xe dừng trong khoảng một giây.
-- [ ] Tắt ESP1 làm ESP2 tự dừng.
-- [ ] Đúng MAC Wi-Fi STA và đúng kênh 6.
-- [ ] UI hiển thị ESP-NOW khi đường chính tốt.
-- [ ] Tắt hoặc che sóng ESP-NOW để kiểm tra trạng thái Bluetooth dự phòng.
-- [ ] Thử đủ 8 hướng ở PWM thấp trước khi tăng tốc.
-- [ ] Kiểm tra ánh sáng và nền camera tại nơi thuyết trình.
+| Không có Web Serial | Dùng Chrome/Edge desktop và HTTPS hoặc localhost |
+| Không thấy ESP1 | Cáp dữ liệu, driver USB, đúng cổng, đóng Serial Monitor |
+| `HOST_ERROR:CRC` | App và ESP1 không cùng protocol GD2 hoặc line bị hỏng |
+| `HOST_ERROR:SEQUENCE` | Dòng cũ/trùng; chờ host timeout hoặc reset ESP1 |
+| `RADIO_ERROR` khi begin | NSS/DIO1/RESET/BUSY/SPI, TCXO và nguồn 3.3 V |
+| ESP1 `LINK:LORA`, xe không chạy | ESP2, config radio hai phía, antenna và wiring motor |
+| Xe chạy ngược | Sửa `LEFT_INVERTED`/`RIGHT_INVERTED`, không đổi dây khi có nguồn |
+| Driver không thức | Kiểm tra STANDBY hoặc đặt `HAS_STANDBY=false` nếu không có pin này |
+| Motor rung nhưng không quay | Đo PWM minimum theo `docs/CALIBRATION.md` |

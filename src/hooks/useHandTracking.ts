@@ -3,13 +3,12 @@ import type {
   HandLandmarker,
   HandLandmarkerResult,
 } from "@mediapipe/tasks-vision";
+import { createDirectionalDrive, type DirectionCode } from "../lib/commands";
 import {
-  createDriveCommand,
-  sameDriveCommand,
+  sameControlCommand,
   STOP_COMMAND,
-  type DirectionCode,
-  type DriveCommand,
-} from "../lib/commands";
+  type ControlCommand,
+} from "../lib/controlTypes";
 import {
   HAND_CONNECTIONS,
   DIRECTION_DEAD_ZONE,
@@ -56,7 +55,7 @@ export interface LiveGesture {
 }
 
 interface Options {
-  onControlUpdate: (command: DriveCommand) => void;
+  onControlUpdate: (command: ControlCommand) => void;
   stableFrames?: number;
 }
 
@@ -75,8 +74,9 @@ const MODEL_URL =
 const ACCENT = "#3b82f6";
 const JOINT = "#dbeafe";
 const SETUP_STABLE_FRAMES = 8;
-const SPEED_DEADBAND = 4;
+const SPEED_DEADBAND = 16;
 const ROLE_RESET_MS = 800;
+const CAMERA_FRAME_TIMEOUT_MS = 180;
 
 const EMPTY_LIVE: LiveGesture = {
   code: null,
@@ -116,17 +116,20 @@ export function useHandTracking({ onControlUpdate, stableFrames = 4 }: Options) 
   const stableDirectionRef = useRef<DirectionCode>("S");
   const speedRef = useRef(0);
   const speedLockedRef = useRef(true);
-  const emittedRef = useRef<DriveCommand | null>(null);
+  const emittedRef = useRef<ControlCommand | null>(null);
   const bothMissingSinceRef = useRef<number | null>(null);
   const lastTsRef = useRef(0);
+  const lastVideoTimeRef = useRef(-1);
+  const lastFreshFrameMsRef = useRef(0);
+  const cameraStalledRef = useRef(false);
   const frameTimesRef = useRef<number[]>([]);
 
   useEffect(() => {
     onControlRef.current = onControlUpdate;
   }, [onControlUpdate]);
 
-  const emit = useCallback((command: DriveCommand) => {
-    if (sameDriveCommand(emittedRef.current, command)) return;
+  const emit = useCallback((command: ControlCommand) => {
+    if (sameControlCommand(emittedRef.current, command)) return;
     emittedRef.current = command;
     onControlRef.current(command);
   }, []);
@@ -257,8 +260,7 @@ export function useHandTracking({ onControlUpdate, stableFrames = 4 }: Options) 
             speedRef.current = 0;
             speedLockedRef.current = true;
             setBothHandsPresent(true);
-            const stop = createDriveCommand("S", 0, true);
-            emit(stop);
+            emit(STOP_COMMAND);
             setLive({
               ...EMPTY_LIVE,
               code: "S",
@@ -338,7 +340,7 @@ export function useHandTracking({ onControlUpdate, stableFrames = 4 }: Options) 
     if (speedGesture.state === "adjusting") speedLockedRef.current = false;
     if (speedGesture.state === "locked") speedLockedRef.current = true;
 
-    const command = createDriveCommand(
+    const command = createDirectionalDrive(
       stableDirectionRef.current,
       speedRef.current,
       speedLockedRef.current,
@@ -365,22 +367,46 @@ export function useHandTracking({ onControlUpdate, stableFrames = 4 }: Options) 
     const landmarker = landmarkerRef.current;
     if (!runningRef.current || !video || !landmarker) return;
 
-    if (video.readyState >= 2) {
+    const loopNow = performance.now();
+    const hasFreshFrame =
+      video.readyState >= 2 && video.currentTime !== lastVideoTimeRef.current;
+    if (hasFreshFrame) {
+      lastVideoTimeRef.current = video.currentTime;
+      lastFreshFrameMsRef.current = loopNow;
+      cameraStalledRef.current = false;
       let timestamp = performance.now();
       if (timestamp <= lastTsRef.current) timestamp = lastTsRef.current + 1;
       lastTsRef.current = timestamp;
-      const result = landmarker.detectForVideo(video, timestamp);
-      drawOverlay(result);
+      try {
+        const result = landmarker.detectForVideo(video, timestamp);
+        drawOverlay(result);
 
-      const now = performance.now();
-      const times = frameTimesRef.current;
-      times.push(now);
-      while (times.length && times[0] < now - 1000) times.shift();
-      setFps(times.length);
-      processHands(result, now);
+        const now = performance.now();
+        const times = frameTimesRef.current;
+        times.push(now);
+        while (times.length && times[0] < now - 1000) times.shift();
+        setFps(times.length);
+        processHands(result, now);
+      } catch (reason) {
+        runningRef.current = false;
+        emit(STOP_COMMAND);
+        setBothHandsPresent(false);
+        setError(reason instanceof Error ? reason.message : String(reason));
+        setStatus("error");
+        return;
+      }
+    } else if (
+      !cameraStalledRef.current &&
+      loopNow - lastFreshFrameMsRef.current > CAMERA_FRAME_TIMEOUT_MS
+    ) {
+      cameraStalledRef.current = true;
+      resetRoles(true);
+      setHandPresent(false);
+      setBothHandsPresent(false);
+      setLive({ ...EMPTY_LIVE, name: "Camera không còn frame mới. Cần setup lại" });
     }
     rafRef.current = requestAnimationFrame(loop);
-  }, [drawOverlay, processHands]);
+  }, [drawOverlay, emit, processHands, resetRoles]);
 
   const start = useCallback(async () => {
     if (runningRef.current) return;
@@ -413,6 +439,9 @@ export function useHandTracking({ onControlUpdate, stableFrames = 4 }: Options) 
       await video.play();
 
       resetRoles(false);
+      lastVideoTimeRef.current = -1;
+      lastFreshFrameMsRef.current = performance.now();
+      cameraStalledRef.current = false;
       runningRef.current = true;
       setStatus("ready");
       rafRef.current = requestAnimationFrame(loop);

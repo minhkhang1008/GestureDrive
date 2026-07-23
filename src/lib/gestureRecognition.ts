@@ -171,7 +171,7 @@ export function recognizeDirection(
 
 function speedFromY(y: number): number {
   const normalized = (SPEED_BOTTOM - y) / (SPEED_BOTTOM - SPEED_TOP);
-  return Math.round(Math.min(1, Math.max(0, normalized)) * 255);
+  return Math.round(Math.min(1, Math.max(0, normalized)) * 1000);
 }
 
 export function recognizeSpeedGesture(

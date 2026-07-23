@@ -1,49 +1,39 @@
-import { motion } from "motion/react";
+import type { ControlMode } from "../lib/controlTypes";
 
-export type Mode = "AUTO" | "MANUAL";
-
-const OPTIONS: { value: Mode; label: string }[] = [
+const OPTIONS: { value: ControlMode; label: string }[] = [
   { value: "AUTO", label: "AUTO" },
   { value: "MANUAL", label: "MANUAL" },
+  { value: "CALIBRATION", label: "CAL" },
 ];
 
 export function ModeToggle({
   mode,
   onChange,
 }: {
-  mode: Mode;
-  onChange: (m: Mode) => void;
+  mode: ControlMode;
+  onChange: (mode: ControlMode) => void;
 }) {
   return (
     <div
       role="tablist"
       aria-label="Chế độ điều khiển"
-      className="relative flex items-center gap-1 rounded-[var(--radius-control)] border border-line bg-surface-2 p-1"
+      className="flex items-center gap-1 rounded-[var(--radius-control)] border border-line bg-surface-2 p-1"
     >
-      {OPTIONS.map((opt) => {
-        const active = mode === opt.value;
+      {OPTIONS.map((option) => {
+        const active = mode === option.value;
         return (
           <button
-            key={opt.value}
+            key={option.value}
             role="tab"
             aria-selected={active}
-            onClick={() => onChange(opt.value)}
-            className="relative px-2.5 py-1.5 text-[12px] font-semibold tracking-wide transition-transform active:scale-[0.97] sm:px-4 sm:text-[13px]"
+            onClick={() => onChange(option.value)}
+            className={`rounded-lg px-2 py-1.5 text-[11px] font-semibold tracking-wide transition-[background-color,color,transform] active:scale-[0.97] sm:px-3 sm:text-[12px] ${
+              active
+                ? "bg-accent-strong text-white"
+                : "text-dim hover:bg-line hover:text-ink"
+            }`}
           >
-            {active && (
-              <motion.span
-                layoutId="mode-pill"
-                transition={{ type: "spring", stiffness: 400, damping: 32 }}
-                className="absolute inset-0 rounded-lg bg-accent-strong"
-              />
-            )}
-            <span
-              className={
-                active ? "relative text-white" : "relative text-dim hover:text-ink"
-              }
-            >
-              {opt.label}
-            </span>
+            {option.label}
           </button>
         );
       })}

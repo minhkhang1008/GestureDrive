@@ -1,12 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { STOP_COMMAND, type ControlCommand } from "../lib/controlTypes";
 import {
-  STOP_COMMAND,
-  toWireLine,
-  type DriveCommand,
-} from "../lib/commands";
+  parseBridgeLine,
+  serializeCommand,
+  type Telemetry,
+} from "../lib/serialProtocol";
 
 export type LinkStatus = "disconnected" | "connecting" | "connected" | "error";
-export type WirelessTransport = "unknown" | "esp-now" | "bluetooth" | "none";
+export type WirelessTransport = "unknown" | "lora" | "none";
+
+export interface BridgeState {
+  hostTimeout: boolean;
+  lastRadioSequence: number | null;
+  radioError: number | null;
+  hostError: string | null;
+  telemetry: Telemetry | null;
+}
 
 export interface SerialLink {
   status: LinkStatus;
@@ -14,105 +23,181 @@ export interface SerialLink {
   portName: string | null;
   error: string | null;
   supported: boolean;
+  lastSentSequence: number | null;
+  bridge: BridgeState;
   connect: () => Promise<void>;
   disconnect: () => Promise<void>;
-  send: (command: DriveCommand) => Promise<boolean>;
+  send: (command: ControlCommand) => Promise<number | null>;
 }
 
 const BAUD_RATE = 115200;
+const INITIAL_BRIDGE_STATE: BridgeState = {
+  hostTimeout: false,
+  lastRadioSequence: null,
+  radioError: null,
+  hostError: null,
+  telemetry: null,
+};
 
-/**
- * USB link to ESP1. ESP1 reports which vehicle link is active using one of:
- * LINK:ESPNOW, LINK:BLUETOOTH, or LINK:NONE.
- */
 export function useSerialConnection(): SerialLink {
   const [status, setStatus] = useState<LinkStatus>("disconnected");
   const [transport, setTransport] = useState<WirelessTransport>("unknown");
   const [portName, setPortName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [lastSentSequence, setLastSentSequence] = useState<number | null>(null);
+  const [bridge, setBridge] = useState<BridgeState>(INITIAL_BRIDGE_STATE);
 
   const portRef = useRef<SerialPort | null>(null);
   const writerRef = useRef<WritableStreamDefaultWriter<Uint8Array> | null>(null);
   const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
   const sequenceRef = useRef(0);
   const closingRef = useRef(false);
+  const writeQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const disconnectHandlerRef = useRef<(() => void) | null>(null);
   const encoderRef = useRef(new TextEncoder());
 
   const supported = typeof navigator !== "undefined" && Boolean(navigator.serial);
 
   const handleBridgeLine = useCallback((line: string) => {
-    const message = line.trim();
-    if (message === "LINK:ESPNOW") setTransport("esp-now");
-    if (message === "LINK:BLUETOOTH") setTransport("bluetooth");
-    if (message === "LINK:NONE") setTransport("none");
-    if (message.startsWith("ERROR:")) setError(message.slice(6).trim());
+    const event = parseBridgeLine(line);
+    if (event.kind === "link") {
+      setTransport(event.value);
+      return;
+    }
+    if (event.kind === "host-timeout") {
+      setBridge((current) => ({
+        ...current,
+        hostTimeout: event.value,
+        hostError: event.value ? current.hostError : null,
+      }));
+      return;
+    }
+    if (event.kind === "radio-tx") {
+      setBridge((current) => ({
+        ...current,
+        lastRadioSequence: event.sequence,
+        radioError: null,
+      }));
+      return;
+    }
+    if (event.kind === "radio-error") {
+      setBridge((current) => ({ ...current, radioError: event.code }));
+      return;
+    }
+    if (event.kind === "host-error") {
+      setBridge((current) => ({ ...current, hostError: event.code }));
+      return;
+    }
+    if (event.kind === "telemetry") {
+      setBridge((current) => ({ ...current, telemetry: event.value }));
+    }
   }, []);
 
   const cleanup = useCallback(async () => {
     closingRef.current = true;
+    const port = portRef.current;
+    const handler = disconnectHandlerRef.current;
+    if (port && handler) port.removeEventListener("disconnect", handler);
+    disconnectHandlerRef.current = null;
+
+    await writeQueueRef.current.catch(() => undefined);
     try {
       await readerRef.current?.cancel();
     } catch {
-      // Reader may already be closed by a physical disconnect.
+      // A physical disconnect may already have closed the reader.
     }
     try {
       readerRef.current?.releaseLock();
     } catch {
-      // Lock may already be released by the read loop.
+      // The read loop may have released the lock first.
     }
     readerRef.current = null;
     try {
       writerRef.current?.releaseLock();
     } catch {
-      // Writer may already be released.
+      // The operating system may already have released the writer.
     }
     writerRef.current = null;
     try {
-      await portRef.current?.close();
+      await port?.close();
     } catch {
-      // The operating system may already have closed the port.
+      // Ignore close errors after unplugging the USB cable.
     }
     portRef.current = null;
     closingRef.current = false;
   }, []);
 
-  const readBridge = useCallback(async (
-    reader: ReadableStreamDefaultReader<Uint8Array>,
-  ) => {
-    const decoder = new TextDecoder();
-    let buffer = "";
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop() ?? "";
-        lines.forEach(handleBridgeLine);
-      }
-    } catch (reason) {
-      if (!closingRef.current) {
-        setError(reason instanceof Error ? reason.message : String(reason));
-        setStatus("error");
-      }
-    } finally {
+  const readBridge = useCallback(
+    async (reader: ReadableStreamDefaultReader<Uint8Array>) => {
+      const decoder = new TextDecoder();
+      let buffer = "";
       try {
-        reader.releaseLock();
-      } catch {
-        // cleanup() may have released it first.
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split(/\r?\n/);
+          buffer = lines.pop() ?? "";
+          lines.forEach(handleBridgeLine);
+        }
+      } catch (reason) {
+        if (!closingRef.current) {
+          setError(reason instanceof Error ? reason.message : String(reason));
+          setStatus("error");
+        }
+      } finally {
+        try {
+          reader.releaseLock();
+        } catch {
+          // cleanup() may have released the reader first.
+        }
+        if (readerRef.current === reader) readerRef.current = null;
       }
-      if (readerRef.current === reader) readerRef.current = null;
-    }
-  }, [handleBridgeLine]);
+    },
+    [handleBridgeLine],
+  );
+
+  const writeCommand = useCallback(
+    (command: ControlCommand): Promise<number | null> => {
+      const sequence = (sequenceRef.current + 1) & 0xffff;
+      sequenceRef.current = sequence;
+      const payload = encoderRef.current.encode(serializeCommand(command, sequence));
+
+      return new Promise((resolve) => {
+        writeQueueRef.current = writeQueueRef.current
+          .catch(() => undefined)
+          .then(async () => {
+            const writer = writerRef.current;
+            if (!writer || closingRef.current) {
+              resolve(null);
+              return;
+            }
+            try {
+              await writer.write(payload);
+              setLastSentSequence(sequence);
+              resolve(sequence);
+            } catch (reason) {
+              if (!closingRef.current) {
+                setError(reason instanceof Error ? reason.message : String(reason));
+                setStatus("error");
+              }
+              resolve(null);
+            }
+          });
+      });
+    },
+    [],
+  );
 
   const connect = useCallback(async () => {
     if (!navigator.serial) {
-      setError("Trình duyệt không hỗ trợ Web Serial. Hãy dùng Chrome hoặc Edge.");
+      setError("Web Serial không được hỗ trợ. Hãy dùng Chrome hoặc Edge desktop.");
       setStatus("error");
       return;
     }
     setError(null);
     setTransport("unknown");
+    setBridge(INITIAL_BRIDGE_STATE);
     setStatus("connecting");
     try {
       const port = await navigator.serial.requestPort();
@@ -125,18 +210,22 @@ export function useSerialConnection(): SerialLink {
       writerRef.current = writer;
       readerRef.current = reader;
       sequenceRef.current = 0;
+      setLastSentSequence(null);
       const info = port.getInfo();
       setPortName(
         info.usbVendorId
           ? `USB ${info.usbVendorId.toString(16).padStart(4, "0")}:${(info.usbProductId ?? 0).toString(16).padStart(4, "0")}`
           : "ESP1",
       );
-      port.addEventListener("disconnect", () => {
+
+      const onDisconnect = () => {
         setStatus("disconnected");
         setTransport("unknown");
         setPortName(null);
         void cleanup();
-      });
+      };
+      disconnectHandlerRef.current = onDisconnect;
+      port.addEventListener("disconnect", onDisconnect);
       setStatus("connected");
       void readBridge(reader);
     } catch (reason) {
@@ -151,29 +240,29 @@ export function useSerialConnection(): SerialLink {
     }
   }, [cleanup, readBridge]);
 
-  const writeCommand = useCallback(async (command: DriveCommand): Promise<boolean> => {
-    const writer = writerRef.current;
-    if (!writer) return false;
-    sequenceRef.current = (sequenceRef.current + 1) & 0xffff;
-    try {
-      await writer.write(
-        encoderRef.current.encode(toWireLine(command, sequenceRef.current)),
-      );
-      return true;
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-      setStatus("error");
-      return false;
-    }
-  }, []);
-
   const disconnect = useCallback(async () => {
-    if (writerRef.current) await writeCommand(STOP_COMMAND);
+    // Stop accepting queued heartbeats, let already queued writes drain/skip,
+    // then make STOP the final write before releasing the port.
+    closingRef.current = true;
+    await writeQueueRef.current.catch(() => undefined);
+    const writer = writerRef.current;
+    if (writer) {
+      const sequence = (sequenceRef.current + 1) & 0xffff;
+      sequenceRef.current = sequence;
+      try {
+        await writer.write(
+          encoderRef.current.encode(serializeCommand(STOP_COMMAND, sequence)),
+        );
+        setLastSentSequence(sequence);
+      } catch {
+        // A physical unplug can make the best-effort final STOP impossible.
+      }
+    }
     await cleanup();
     setStatus("disconnected");
     setTransport("unknown");
     setPortName(null);
-  }, [cleanup, writeCommand]);
+  }, [cleanup]);
 
   useEffect(() => {
     return () => {
@@ -187,6 +276,8 @@ export function useSerialConnection(): SerialLink {
     portName,
     error,
     supported,
+    lastSentSequence,
+    bridge,
     connect,
     disconnect,
     send: writeCommand,

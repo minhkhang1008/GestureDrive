@@ -9,8 +9,8 @@ import {
 import type { RefObject } from "react";
 import type { LiveGesture, TrackingStatus } from "../hooks/useHandTracking";
 import { COMMANDS } from "../lib/commands";
+import type { ControlMode } from "../lib/controlTypes";
 import { CommandGlyph } from "./CommandGlyph";
-import type { Mode } from "./ModeToggle";
 
 interface Props {
   videoRef: RefObject<HTMLVideoElement | null>;
@@ -21,7 +21,7 @@ interface Props {
   handPresent: boolean;
   bothHandsPresent: boolean;
   directionDeadZone: number;
-  mode: Mode;
+  mode: ControlMode;
   onStart: () => void;
 }
 
@@ -94,18 +94,18 @@ export function CameraPanel({
 }: Props) {
   const ready = status === "ready";
   const command = live.code ? COMMANDS[live.code] : null;
-  const speedTop = `${(1 - live.speed / 255) * 100}%`;
+  const speedTop = `${(1 - live.speed / 1000) * 100}%`;
 
   return (
-    <section className="flex flex-col rounded-[var(--radius-panel)] border border-line bg-surface p-4 lg:min-h-0 lg:flex-1">
+    <section className="flex flex-col rounded-[var(--radius-panel)] border border-line bg-surface p-4">
       <div className="mb-3 flex items-center justify-between px-1">
         <h2 className="text-[13px] font-semibold text-ink">Camera trực tiếp</h2>
-        <span className="font-mono text-[11px] text-faint">
+        <span className="hidden font-mono text-[11px] text-faint sm:inline">
           MediaPipe, tối đa 2 tay
         </span>
       </div>
 
-      <div className="relative aspect-video min-h-[300px] overflow-hidden rounded-xl bg-[#050507] lg:aspect-auto lg:min-h-0 lg:flex-1">
+      <div className="relative aspect-video min-h-[300px] overflow-hidden rounded-xl bg-[#050507]">
         <video
           ref={videoRef}
           playsInline
@@ -172,7 +172,7 @@ export function CameraPanel({
               </div>
             )}
 
-            {mode === "MANUAL" && (
+            {mode !== "AUTO" && (
               <div className="absolute right-3 top-3 rounded-lg border border-white/15 bg-black/50 px-2.5 py-1 backdrop-blur-sm">
                 <span className="text-[10px] font-medium text-white/80">AI tạm dừng</span>
               </div>
@@ -234,7 +234,7 @@ export function CameraPanel({
                 </span>
                 <div className="min-w-0 pr-1">
                   <p className="truncate text-[13px] font-medium leading-tight text-white">
-                    {mode === "MANUAL"
+                    {mode !== "AUTO"
                       ? "Đang chờ nút bấm"
                       : handPresent
                         ? live.name
@@ -255,7 +255,7 @@ export function CameraPanel({
                   )}
                   <div>
                     <p className="font-mono text-[12px] font-semibold text-white">
-                      PWM {live.speed}
+                      LIMIT {live.speed}
                     </p>
                     <p className="text-[9px] text-white/50">
                       {!bothHandsPresent

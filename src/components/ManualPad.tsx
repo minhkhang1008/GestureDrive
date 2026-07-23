@@ -1,10 +1,6 @@
 import { Gauge, HandPalm } from "@phosphor-icons/react";
 import { CommandGlyph } from "./CommandGlyph";
-import {
-  COMMAND_ORDER,
-  COMMANDS,
-  type DirectionCode,
-} from "../lib/commands";
+import { COMMAND_ORDER, COMMANDS, type DirectionCode } from "../lib/commands";
 
 const KEY_HINT: Partial<Record<DirectionCode, string>> = {
   F: "W",
@@ -14,95 +10,107 @@ const KEY_HINT: Partial<Record<DirectionCode, string>> = {
   S: "Space",
 };
 
-function PadKey({
+function DeadmanDirection({
   code,
   active,
-  onPress,
+  onStart,
+  onStop,
 }: {
   code: DirectionCode;
   active: boolean;
-  onPress: (code: DirectionCode) => void;
+  onStart: (code: DirectionCode) => void;
+  onStop: () => void;
 }) {
-  const isStop = code === "S";
-  const palette = isStop
-    ? active
-      ? "border-stop/60 bg-stop/20 text-stop"
-      : "border-line bg-surface-2 text-stop/80 hover:border-stop/40"
-    : active
-      ? "border-accent/60 bg-accent/20 text-accent"
-      : "border-line bg-surface-2 text-dim hover:border-line-strong hover:text-ink";
+  const stop = code === "S";
+  const release = () => onStop();
 
   return (
     <button
-      onPointerDown={() => onPress(code)}
+      type="button"
+      onPointerDown={(event) => {
+        event.preventDefault();
+        event.currentTarget.setPointerCapture(event.pointerId);
+        if (stop) onStop();
+        else onStart(code);
+      }}
+      onPointerUp={release}
+      onPointerCancel={release}
+      onPointerLeave={release}
+      onContextMenu={(event) => event.preventDefault()}
       aria-label={`${COMMANDS[code].label}${KEY_HINT[code] ? ` (${KEY_HINT[code]})` : ""}`}
-      className={`group flex aspect-square select-none flex-col items-center justify-center gap-0.5 rounded-[var(--radius-control)] border transition-all active:scale-[0.94] ${palette}`}
+      className={`flex aspect-square select-none touch-none flex-col items-center justify-center gap-0.5 rounded-[var(--radius-control)] border transition-[background-color,border-color,color,transform] active:scale-[0.94] ${
+        stop
+          ? "border-stop/50 bg-stop/12 text-stop hover:bg-stop/20"
+          : active
+            ? "border-accent/60 bg-accent/20 text-accent"
+            : "border-line bg-surface-2 text-dim hover:border-line-strong hover:text-ink"
+      }`}
     >
-      {isStop ? (
-        <HandPalm size={20} weight={active ? "fill" : "bold"} />
-      ) : (
-        <CommandGlyph code={code} size={20} />
-      )}
-      <span className="font-mono text-[9px] opacity-65">
-        {KEY_HINT[code] ?? code}
-      </span>
+      {stop ? <HandPalm size={20} weight="bold" /> : <CommandGlyph code={code} size={20} />}
+      <span className="font-mono text-[9px] opacity-70">{KEY_HINT[code] ?? code}</span>
     </button>
   );
 }
 
 export function ManualPad({
   active,
-  speed,
-  onSpeedChange,
-  onCommand,
+  speedLimit,
+  onSpeedLimitChange,
+  onStart,
+  onStop,
 }: {
   active: DirectionCode | null;
-  speed: number;
-  onSpeedChange: (speed: number) => void;
-  onCommand: (code: DirectionCode) => void;
+  speedLimit: number;
+  onSpeedLimitChange: (speedLimit: number) => void;
+  onStart: (code: DirectionCode) => void;
+  onStop: () => void;
 }) {
   return (
-    <div className="rounded-[var(--radius-panel)] border border-line bg-surface p-5">
+    <section className="rounded-[var(--radius-panel)] border border-line bg-surface p-5">
       <div className="mb-4 flex items-center justify-between">
-        <p className="text-[12px] font-medium text-dim">Điều khiển thủ công</p>
-        <span className="font-mono text-[11px] text-accent">PWM {speed}</span>
+        <div>
+          <h2 className="text-[12px] font-medium text-dim">Điều khiển MANUAL</h2>
+          <p className="mt-0.5 text-[10px] text-faint">Nhấn giữ để chạy, thả để dừng</p>
+        </div>
+        <span className="font-mono text-[11px] text-accent">LIMIT {speedLimit}</span>
       </div>
 
       <div className="grid grid-cols-[1fr_126px] gap-4">
         <div className="grid grid-cols-3 gap-1.5">
           {COMMAND_ORDER.map((code) => (
-            <PadKey
+            <DeadmanDirection
               key={code}
               code={code}
               active={active === code}
-              onPress={onCommand}
+              onStart={onStart}
+              onStop={onStop}
             />
           ))}
         </div>
 
         <label className="flex flex-col justify-center gap-3 rounded-[var(--radius-control)] border border-line bg-surface-2 px-3 py-3">
           <span className="flex items-center gap-1.5 text-[11px] text-dim">
-            <Gauge size={14} /> Tốc độ
+            <Gauge size={14} /> Giới hạn
           </span>
           <input
             type="range"
             min="0"
-            max="255"
-            step="5"
-            value={speed}
-            onChange={(event) => onSpeedChange(Number(event.target.value))}
+            max="1000"
+            step="25"
+            value={speedLimit}
+            onChange={(event) => onSpeedLimitChange(Number(event.target.value))}
             className="w-full accent-accent"
-            aria-label="Tốc độ động cơ thủ công"
+            aria-label="Giới hạn tốc độ manual"
           />
-          <span className="text-[10px] leading-snug text-faint">
-            Đổi tốc độ sẽ cập nhật hướng đang chạy.
+          <span className="font-mono text-[10px] leading-snug text-faint">
+            {Math.round(speedLimit / 10)}% packet
           </span>
         </label>
       </div>
 
       <p className="mt-4 text-center text-[11px] text-faint">
-        W A S D cho bốn hướng chính, Space để dừng.
+        Giữ W/A/S/D để chạy. Space luôn dừng.
       </p>
-    </div>
+    </section>
   );
 }
