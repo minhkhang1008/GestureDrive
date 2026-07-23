@@ -238,6 +238,10 @@ bool initializeRadio() {
     reportRadioFailure(state);
     return false;
   }
+  radio.setRfSwitchPins(
+    transmitter_pins::LORA_RXEN,
+    transmitter_pins::LORA_TXEN
+);
 
   const int16_t crcState = radio.setCRC(radio_config::PHY_CRC_ENABLED);
   if (crcState != RADIOLIB_ERR_NONE) {
