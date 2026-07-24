@@ -5,7 +5,7 @@ sau có motor, bánh còn lại là caster. Nhận dạng tay chạy trên lapto
 là nơi trộn differential drive, hiệu chỉnh motor, ramp và thực thi failsafe.
 
 ```text
-Camera -> React + MediaPipe -> USB Web Serial -> ESP1 -> SX1262
+Camera -> MediaPipe worker -> React -> USB Web Serial -> ESP1 -> SX1262
                                                      raw LoRa P2P
                                             SX1262 -> ESP2 -> driver -> 2 motor
 ```
@@ -18,6 +18,10 @@ ESP-NOW hay Bluetooth Classic. ESP32-S3 không hỗ trợ Bluetooth Classic.
 P0 đã có trong source:
 
 - Ba mode `AUTO`, `MANUAL`, `CALIBRATION`.
+- MediaPipe Hand Landmarker chạy trong worker, GPU trước/CPU fallback, tối đa
+  hai tay và không chặn React bằng `detectForVideo()`.
+- Xòe/nắm để gán role; tám hướng theo tâm tay; pinch ngón cái-trỏ để kéo và
+  thả để khóa tốc độ.
 - `STOP`, `DRIVE`, `DIRECT_PWM`, E-stop latch và chuỗi reset rõ ràng.
 - Dead-man cho pointer và W/A/S/D; Space dừng, Escape E-stop.
 - Hai slider motor độc lập, tám nút thử motor và timed pulse 250-2000 ms.
@@ -132,6 +136,7 @@ source canonical bên dưới `firmware/`.
 
 - [Hướng dẫn vận hành](USAGE_GUIDE.md)
 - [Kiến trúc](docs/ARCHITECTURE.md)
+- [AI gesture pipeline và lựa chọn model](docs/AI_GESTURE_PIPELINE.md)
 - [Protocol GD2 và packet 16 byte](docs/PROTOCOL.md)
 - [Đấu nối phần cứng](docs/HARDWARE_WIRING.md)
 - [Hiệu chỉnh motor](docs/CALIBRATION.md)

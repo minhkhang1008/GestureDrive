@@ -27,6 +27,7 @@ export interface SpeedGestureResult {
   state: SpeedGestureState;
   value: number | null;
   fingers: boolean[];
+  pinchRatio: number;
 }
 
 const WRIST = 0;
@@ -39,6 +40,8 @@ const TIP = { thumb: 4, index: 8, middle: 12, ring: 16, pinky: 20 };
 export const DIRECTION_DEAD_ZONE = 0.035;
 export const SPEED_TOP = 0.14;
 export const SPEED_BOTTOM = 0.86;
+export const PINCH_ENTER_RATIO = 0.42;
+export const PINCH_EXIT_RATIO = 0.56;
 
 function distance(a: Landmark, b: Landmark): number {
   return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
@@ -169,30 +172,48 @@ export function recognizeDirection(
   return { code, name: DIRECTION_NAMES[code], orientationValid: true };
 }
 
-function speedFromY(y: number): number {
+export function speedFromY(y: number): number {
   const normalized = (SPEED_BOTTOM - y) / (SPEED_BOTTOM - SPEED_TOP);
   return Math.round(Math.min(1, Math.max(0, normalized)) * 1000);
+}
+
+export function normalizedPinchDistance(lm: Landmark[]): number {
+  const palmScale = Math.max(
+    distance(lm[WRIST], lm[MCP.middle]),
+    distance(lm[MCP.index], lm[MCP.pinky]),
+    0.001,
+  );
+  return distance(lm[TIP.thumb], lm[TIP.index]) / palmScale;
 }
 
 export function recognizeSpeedGesture(
   lm: Landmark[],
   handedness: Handedness,
+  wasAdjusting = false,
 ): SpeedGestureResult {
   const fingers = fingersUp(lm, handedness);
-  const [thumb, index, middle, ring, pinky] = fingers;
-  const otherFingersTucked = !middle && !ring && !pinky;
+  const [, , middle, ring, pinky] = fingers;
+  const supportingFingerCount = [middle, ring, pinky].filter(Boolean).length;
+  const pinchRatio = normalizedPinchDistance(lm);
+  const pinchThreshold = wasAdjusting ? PINCH_EXIT_RATIO : PINCH_ENTER_RATIO;
 
-  if (thumb && index && otherFingersTucked) {
+  // The speed hand acts like a draggable slider:
+  // thumb-index pinch = grab and adjust, release = lock the current value.
+  // Requiring two supporting fingers to remain open avoids confusing a fist
+  // or an accidental finger crossing with a speed command.
+  if (supportingFingerCount >= 2 && pinchRatio <= pinchThreshold) {
+    const pinchY = (lm[TIP.thumb].y + lm[TIP.index].y) / 2;
     return {
       state: "adjusting",
-      value: speedFromY(lm[TIP.index].y),
+      value: speedFromY(pinchY),
       fingers,
+      pinchRatio,
     };
   }
-  if (!thumb && index && otherFingersTucked) {
-    return { state: "locked", value: null, fingers };
+  if (supportingFingerCount >= 2) {
+    return { state: "locked", value: null, fingers, pinchRatio };
   }
-  return { state: "invalid", value: null, fingers };
+  return { state: "invalid", value: null, fingers, pinchRatio };
 }
 
 export function handSpan(lm: Landmark[]): number {

@@ -265,7 +265,7 @@ export default function App() {
     [dispatch],
   );
 
-  const tracking = useHandTracking({ onControlUpdate, stableFrames: 4 });
+  const tracking = useHandTracking({ onControlUpdate, stableFrames: 2 });
 
   const startManual = useCallback(
     (code: DirectionCode) => {
@@ -467,6 +467,9 @@ export default function App() {
                 handPresent={tracking.handPresent}
                 bothHandsPresent={tracking.bothHandsPresent}
                 directionDeadZone={tracking.directionDeadZone}
+                inferenceMs={tracking.inferenceMs}
+                pipelineLatencyMs={tracking.pipelineLatencyMs}
+                delegate={tracking.delegate}
                 mode={mode}
                 onStart={() => void tracking.start()}
               />
