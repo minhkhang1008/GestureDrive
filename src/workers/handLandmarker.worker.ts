@@ -36,7 +36,9 @@ function messageFrom(reason: unknown): string {
 async function createLandmarker(
   selectedDelegate: HandLandmarkerDelegate,
 ): Promise<HandLandmarker> {
-  const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+  // This is an ES module worker. The default classic WASM loader relies on
+  // importScripts(), which is unavailable here and leaves ModuleFactory unset.
+  const vision = await FilesetResolver.forVisionTasks(WASM_URL, true);
   return HandLandmarker.createFromOptions(vision, {
     baseOptions: {
       modelAssetPath: MODEL_URL,
