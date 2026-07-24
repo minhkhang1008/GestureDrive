@@ -39,8 +39,8 @@ export function GestureLegend() {
             <LockSimple size={8} weight="fill" className="absolute bottom-0.5 right-0.5" />
           </span>
           <p className="text-[11px] leading-relaxed text-dim">
-            <span className="font-medium text-ink">Tốc độ:</span> chỉ duỗi ngón trỏ và
-            ngón cái để kéo. Thu ngón cái để khóa mức hiện tại.
+            <span className="font-medium text-ink">Tốc độ:</span> chụm ngón cái-trỏ
+            kiểu OK để kéo lên/xuống. Thả chụm để khóa mức hiện tại.
           </p>
         </div>
       </div>

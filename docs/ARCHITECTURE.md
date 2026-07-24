@@ -3,10 +3,10 @@
 ## Data path
 
 ```text
-Laptop camera
+Laptop camera 1280x720
     |
     v
-MediaPipe Hand Landmarker
+ImageBitmap -> MediaPipe Hand Landmarker worker
     |
     v
 React control state -> GD2 ASCII + CRC, 20 Hz -> USB Web Serial
@@ -34,7 +34,11 @@ LoRaWAN, network server, ESP-NOW và Bluetooth Classic không nằm trong kiến
 
 ### Browser
 
-- MediaPipe và camera chỉ chạy tại laptop.
+- Camera và MediaPipe chỉ chạy tại laptop; hình ảnh không gửi lên server.
+- `detectForVideo()` chạy trong dedicated worker, GPU trước và CPU fallback.
+- Chỉ có một inference đang chạy; frame cũ không bị xếp hàng.
+- Quy ước role, tám hướng, lòng/mu bàn tay và pinch tốc độ nằm trong
+  [`AI_GESTURE_PIPELINE.md`](AI_GESTURE_PIPELINE.md).
 - State điều khiển có đúng ba packet type: STOP, DRIVE, DIRECT_PWM.
 - Một Web Serial writer duy nhất serialize command với sequence và CRC.
 - Heartbeat gửi latest command mỗi 50 ms, độc lập render camera.

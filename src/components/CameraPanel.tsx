@@ -10,6 +10,7 @@ import type { RefObject } from "react";
 import type { LiveGesture, TrackingStatus } from "../hooks/useHandTracking";
 import { COMMANDS } from "../lib/commands";
 import type { ControlMode } from "../lib/controlTypes";
+import type { HandLandmarkerDelegate } from "../lib/handLandmarkerWorkerProtocol";
 import { CommandGlyph } from "./CommandGlyph";
 
 interface Props {
@@ -21,6 +22,9 @@ interface Props {
   handPresent: boolean;
   bothHandsPresent: boolean;
   directionDeadZone: number;
+  inferenceMs: number;
+  pipelineLatencyMs: number;
+  delegate: HandLandmarkerDelegate | null;
   mode: ControlMode;
   onStart: () => void;
 }
@@ -89,6 +93,9 @@ export function CameraPanel({
   handPresent,
   bothHandsPresent,
   directionDeadZone,
+  inferenceMs,
+  pipelineLatencyMs,
+  delegate,
   mode,
   onStart,
 }: Props) {
@@ -101,7 +108,9 @@ export function CameraPanel({
       <div className="mb-3 flex items-center justify-between px-1">
         <h2 className="text-[13px] font-semibold text-ink">Camera trực tiếp</h2>
         <span className="hidden font-mono text-[11px] text-faint sm:inline">
-          MediaPipe, tối đa 2 tay
+          {ready && delegate
+            ? `${delegate} worker · AI ${inferenceMs.toFixed(1)} ms · tổng ${pipelineLatencyMs.toFixed(1)} ms`
+            : "MediaPipe Hand Landmarker · worker · 2 tay"}
         </span>
       </div>
 
@@ -212,7 +221,7 @@ export function CameraPanel({
                     0
                   </span>
                   <span
-                    className="absolute left-1/2 size-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-accent transition-[top] duration-150"
+                    className="absolute left-1/2 size-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-accent transition-[top] duration-75"
                     style={{ top: speedTop }}
                   />
                 </div>
