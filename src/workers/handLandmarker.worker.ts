@@ -39,6 +39,11 @@ async function createLandmarker(
   // This is an ES module worker. The default classic WASM loader relies on
   // importScripts(), which is unavailable here and leaves ModuleFactory unset.
   const vision = await FilesetResolver.forVisionTasks(WASM_URL, true);
+  if (selectedDelegate === "CPU") {
+    // MediaPipe clears ModuleFactory after use. A distinct module URL makes
+    // the CPU fallback execute the loader again instead of hitting ESM cache.
+    vision.wasmLoaderPath += "?fallback=cpu";
+  }
   return HandLandmarker.createFromOptions(vision, {
     baseOptions: {
       modelAssetPath: MODEL_URL,
