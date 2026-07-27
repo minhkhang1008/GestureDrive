@@ -1,3 +1,4 @@
+import { ArrowCounterClockwise, WarningOctagon } from "@phosphor-icons/react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CalibrationPanel } from "./components/CalibrationPanel";
 import { CameraPanel } from "./components/CameraPanel";
@@ -7,6 +8,7 @@ import { EmergencyStop } from "./components/EmergencyStop";
 import { GestureLegend } from "./components/GestureLegend";
 import { LinkTelemetry } from "./components/LinkTelemetry";
 import { ManualPad } from "./components/ManualPad";
+import { SafetyStrip } from "./components/SafetyStrip";
 import { TopBar } from "./components/TopBar";
 import { useControlHeartbeat } from "./hooks/useControlHeartbeat";
 import { useHandTracking } from "./hooks/useHandTracking";
@@ -44,6 +46,8 @@ const KEY_MAP: Record<string, DirectionCode> = {
 };
 
 const HAND_LOSS_STOP_MS = 180;
+/** Telemetry older than this is treated as unknown vehicle state. */
+const TELEMETRY_FRESH_MS = 2500;
 
 function wait(milliseconds: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
@@ -62,6 +66,7 @@ export default function App() {
   const serialStatus = link.status;
   const radioTransport = link.transport;
   const telemetrySnapshot = link.bridge.telemetry;
+  const telemetryReceivedAt = link.bridge.telemetryReceivedAt;
   const [mode, setMode] = useState<ControlMode>("AUTO");
   const [current, setCurrent] = useState<PresentedCommand>(INITIAL_COMMAND);
   const [previous, setPrevious] = useState<PresentedCommand | null>(null);
@@ -70,6 +75,7 @@ export default function App() {
   const [activeDirection, setActiveDirection] = useState<DirectionCode | null>(null);
   const [estopLatched, setEstopLatched] = useState(false);
   const [resettingEstop, setResettingEstop] = useState(false);
+  const [estopResetNote, setEstopResetNote] = useState<string | null>(null);
   const [log, setLog] = useState<LogEntry[]>([]);
 
   const modeRef = useRef<ControlMode>(mode);
@@ -78,13 +84,27 @@ export default function App() {
   const resettingRef = useRef(false);
   const resetAttemptRef = useRef(0);
   const pulseTimerRef = useRef<number | null>(null);
-  const pressedKeysRef = useRef(new Set<string>());
+  const keyStackRef = useRef<string[]>([]);
   const logIdRef = useRef(0);
+  const lastGestureLogRef = useRef<string | null>(null);
   const previousLinkStatusRef = useRef(link.status);
+  // Log context lives in refs so dispatch and the window key listeners do not
+  // re-subscribe every time telemetry arrives.
+  const serialStatusRef = useRef(serialStatus);
+  const radioTransportRef = useRef(radioTransport);
+  const telemetryRef = useRef(telemetrySnapshot);
+  const telemetryReceivedAtRef = useRef(telemetryReceivedAt);
 
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+
+  useEffect(() => {
+    serialStatusRef.current = serialStatus;
+    radioTransportRef.current = radioTransport;
+    telemetryRef.current = telemetrySnapshot;
+    telemetryReceivedAtRef.current = telemetryReceivedAt;
+  }, [radioTransport, serialStatus, telemetrySnapshot, telemetryReceivedAt]);
 
   const setHeartbeatCommand = useControlHeartbeat({
     command: current.command,
@@ -122,8 +142,6 @@ export default function App() {
       sequence: number | null,
       modeAtDispatch: ControlMode,
       timestamp: string,
-      linkStatus: string,
-      telemetry: LogEntry["telemetry"],
     ) => {
       logIdRef.current += 1;
       const entry: LogEntry = {
@@ -134,8 +152,8 @@ export default function App() {
         label,
         source,
         sequence,
-        linkStatus,
-        telemetry,
+        linkStatus: `${serialStatusRef.current}/${radioTransportRef.current}`,
+        telemetry: telemetryRef.current,
       };
       setLog((entries) => [entry, ...entries].slice(0, 250));
     },
@@ -150,21 +168,11 @@ export default function App() {
       presentCommand({ command, label, source });
       const modeAtDispatch = modeRef.current;
       const timestamp = new Date().toISOString();
-      const linkStatus = `${serialStatus}/${radioTransport}`;
       void sendToBridge(command).then((sequence) => {
-        appendLog(
-          command,
-          label,
-          source,
-          sequence,
-          modeAtDispatch,
-          timestamp,
-          linkStatus,
-          telemetrySnapshot,
-        );
+        appendLog(command, label, source, sequence, modeAtDispatch, timestamp);
       });
     },
-    [appendLog, cancelPulse, presentCommand, radioTransport, sendToBridge, serialStatus, telemetrySnapshot],
+    [appendLog, cancelPulse, presentCommand, sendToBridge],
   );
 
   const stopNow = useCallback(
@@ -175,7 +183,7 @@ export default function App() {
         setResettingEstop(false);
       }
       setActiveDirection(null);
-      pressedKeysRef.current.clear();
+      keyStackRef.current = [];
       dispatch(estopRef.current ? ESTOP_COMMAND : STOP_COMMAND, "safety", label);
     },
     [dispatch],
@@ -185,11 +193,12 @@ export default function App() {
     resetAttemptRef.current += 1;
     resettingRef.current = false;
     setResettingEstop(false);
+    setEstopResetNote(null);
     cancelPulse();
     estopRef.current = true;
     setEstopLatched(true);
     setActiveDirection(null);
-    pressedKeysRef.current.clear();
+    keyStackRef.current = [];
     dispatch(ESTOP_COMMAND, "safety", "E-STOP đã khóa");
   }, [cancelPulse, dispatch]);
 
@@ -199,21 +208,27 @@ export default function App() {
     const resetAttempt = resetAttemptRef.current + 1;
     resetAttemptRef.current = resetAttempt;
     setResettingEstop(true);
+    setEstopResetNote(null);
     cancelPulse();
 
-    const disarmed: PresentedCommand = {
+    const abortReset = (label: string) => {
+      presentCommand({ command: ESTOP_COMMAND, label, source: "safety" });
+      resettingRef.current = false;
+      setResettingEstop(false);
+    };
+
+    // Phase 1: a clean run of disarmed STOPs. ESP2 requires at least three
+    // before it will honor RESET_ESTOP; ten give margin over radio loss.
+    presentCommand({
       command: STOP_COMMAND,
       label: "Chuỗi STOP disarmed",
       source: "safety",
-    };
-    presentCommand(disarmed);
-    for (let index = 0; index < 4; index += 1) {
+    });
+    for (let index = 0; index < 10; index += 1) {
       const sequence = await link.send(STOP_COMMAND);
       if (resetAttemptRef.current !== resetAttempt) return;
       if (sequence === null) {
-        presentCommand({ command: ESTOP_COMMAND, label: "E-STOP vẫn khóa", source: "safety" });
-        resettingRef.current = false;
-        setResettingEstop(false);
+        abortReset("E-STOP vẫn khóa");
         return;
       }
       await wait(55);
@@ -230,42 +245,103 @@ export default function App() {
       resetSequence = await link.send(RESET_ESTOP_COMMAND);
       if (resetAttemptRef.current !== resetAttempt) return;
       if (resetSequence === null) {
-        presentCommand({ command: ESTOP_COMMAND, label: "E-STOP vẫn khóa", source: "safety" });
-        resettingRef.current = false;
-        setResettingEstop(false);
+        abortReset("E-STOP vẫn khóa");
         return;
       }
       await wait(55);
       if (resetAttemptRef.current !== resetAttempt) return;
     }
 
+    // Phase 3: close the loop with vehicle telemetry when it is flowing.
+    const telemetryFresh = () =>
+      telemetryReceivedAtRef.current !== null &&
+      performance.now() - telemetryReceivedAtRef.current <= TELEMETRY_FRESH_MS;
+
+    let confirmed = false;
+    let sawTelemetry = false;
+    for (let index = 0; index < 6; index += 1) {
+      if (telemetryFresh()) {
+        sawTelemetry = true;
+        if (telemetryRef.current?.estop === false) {
+          confirmed = true;
+          break;
+        }
+      }
+      await link.send(STOP_COMMAND);
+      await wait(250);
+      if (resetAttemptRef.current !== resetAttempt) return;
+    }
+
+    if (sawTelemetry && !confirmed) {
+      abortReset("Xe chưa xác nhận reset E-stop");
+      setEstopResetNote(
+        "Telemetry vẫn báo E-stop khóa trên xe. Kiểm tra liên kết LoRa rồi thử lại.",
+      );
+      return;
+    }
+
     estopRef.current = false;
     setEstopLatched(false);
     resettingRef.current = false;
     setResettingEstop(false);
+    setEstopResetNote(
+      confirmed
+        ? null
+        : "Đã reset phía trạm điều khiển. Chưa có telemetry từ xe để xác nhận.",
+    );
     presentCommand(INITIAL_COMMAND);
     await link.send(STOP_COMMAND);
     appendLog(
       RESET_ESTOP_COMMAND,
-      "Arm / Reset E-stop hoàn tất",
+      confirmed ? "Arm / Reset E-stop: xe đã xác nhận" : "Arm / Reset E-stop (chưa xác nhận)",
       "safety",
       resetSequence,
       modeRef.current,
       new Date().toISOString(),
-      `${link.status}/${link.transport}`,
-      link.bridge.telemetry,
     );
   }, [appendLog, cancelPulse, link, presentCommand]);
 
+  // Vehicle-reported E-stop wins: if fresh telemetry says the latch is set
+  // while the UI thinks it is clear, re-latch so the reset flow stays the
+  // single path back to armed.
+  useEffect(() => {
+    if (!telemetrySnapshot || telemetryReceivedAt === null) return;
+    if (
+      telemetrySnapshot.estop === true &&
+      !estopRef.current &&
+      !resettingRef.current
+    ) {
+      estopRef.current = true;
+      setEstopLatched(true);
+      presentCommand({
+        command: ESTOP_COMMAND,
+        label: "E-STOP báo từ xe",
+        source: "safety",
+      });
+    }
+  }, [presentCommand, telemetryReceivedAt, telemetrySnapshot]);
+
   const onControlUpdate = useCallback(
-    (command: ControlCommand) => {
+    (command: ControlCommand, label: string) => {
       if (modeRef.current !== "AUTO" || estopRef.current) return;
-      dispatch(command, "gesture", command.type === COMMAND_TYPE.STOP ? "Gesture STOP" : "Gesture DRIVE");
+      cancelPulse();
+      presentCommand({ command, label, source: "gesture" });
+      // Analog updates stream continuously; the log only records transitions
+      // (sector change, stop/start) so it stays readable.
+      const shouldLog = label !== lastGestureLogRef.current;
+      lastGestureLogRef.current = label;
+      const modeAtDispatch = modeRef.current;
+      const timestamp = new Date().toISOString();
+      void sendToBridge(command).then((sequence) => {
+        if (!shouldLog) return;
+        appendLog(command, label, "gesture", sequence, modeAtDispatch, timestamp);
+      });
     },
-    [dispatch],
+    [appendLog, cancelPulse, presentCommand, sendToBridge],
   );
 
-  const tracking = useHandTracking({ onControlUpdate, stableFrames: 2 });
+  const tracking = useHandTracking({ onControlUpdate });
+  const resetTrackingControl = tracking.resetControlState;
 
   const startManual = useCallback(
     (code: DirectionCode) => {
@@ -306,30 +382,20 @@ export default function App() {
     (nextMode: ControlMode) => {
       if (nextMode === modeRef.current) return;
       stopNow("STOP trước khi đổi mode");
+      // A stale gesture command must never survive a mode round trip: clear
+      // the tracker's emit-dedupe state and force role re-confirmation.
+      resetTrackingControl();
+      lastGestureLogRef.current = null;
       modeRef.current = nextMode;
       setMode(nextMode);
     },
-    [stopNow],
+    [resetTrackingControl, stopNow],
   );
 
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === " ") {
-        event.preventDefault();
-        if (!event.repeat) stopNow("STOP bằng Space");
-        return;
-      }
-      if (event.key === "Escape") {
-        event.preventDefault();
-        if (!event.repeat) triggerEstop();
-        return;
-      }
-      if (modeRef.current === "AUTO" || isEditableTarget(event.target)) return;
-      const key = event.key.toLowerCase();
+  const applyDirectionKey = useCallback(
+    (key: string) => {
       const code = KEY_MAP[key];
-      if (!code || event.repeat || pressedKeysRef.current.has(key)) return;
-      event.preventDefault();
-      pressedKeysRef.current.add(key);
+      if (!code) return;
       if (modeRef.current === "MANUAL") {
         startManual(code);
         return;
@@ -341,14 +407,49 @@ export default function App() {
         a: [-limit, limit],
         d: [limit, -limit],
       };
-      const [left, right] = direct[key];
-      startCalibration(left, right, `Giữ phím ${key.toUpperCase()}`);
+      const channels = direct[key];
+      if (!channels) return;
+      startCalibration(channels[0], channels[1], `Giữ phím ${key.toUpperCase()}`);
+    },
+    [calibrationLimitPercent, startCalibration, startManual],
+  );
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === " ") {
+        if (!isEditableTarget(event.target)) event.preventDefault();
+        if (!event.repeat) stopNow("STOP bằng Space");
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        if (!event.repeat) triggerEstop();
+        return;
+      }
+      if (modeRef.current === "AUTO" || isEditableTarget(event.target)) return;
+      // Browser/system shortcuts must never start the vehicle.
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      const key = event.key.toLowerCase();
+      if (!KEY_MAP[key] || event.repeat) return;
+      event.preventDefault();
+      const stack = keyStackRef.current;
+      if (!stack.includes(key)) stack.push(key);
+      applyDirectionKey(key);
     };
 
     const onKeyUp = (event: KeyboardEvent) => {
       const key = event.key.toLowerCase();
-      if (!pressedKeysRef.current.delete(key)) return;
+      const stack = keyStackRef.current;
+      const index = stack.indexOf(key);
+      if (index === -1) return;
       event.preventDefault();
+      stack.splice(index, 1);
+      const nextKey = stack[stack.length - 1];
+      if (nextKey) {
+        // Most-recent still-held key takes over instead of stopping the run.
+        applyDirectionKey(nextKey);
+        return;
+      }
       stopNow(`Nhả phím ${key.toUpperCase()}`);
     };
 
@@ -358,7 +459,7 @@ export default function App() {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, [calibrationLimitPercent, startCalibration, startManual, stopNow, triggerEstop]);
+  }, [applyDirectionKey, stopNow, triggerEstop]);
 
   useEffect(() => {
     const stopForLifecycle = () => stopNow("STOP do mất focus hoặc ẩn trang");
@@ -375,11 +476,46 @@ export default function App() {
     };
   }, [stopNow]);
 
+  // Screen sleep silently stops the vehicle mid-run: hold a wake lock while
+  // the serial link is up, re-acquiring on return to visibility (the browser
+  // releases wake locks whenever the page hides).
+  useEffect(() => {
+    if (serialStatus !== "connected") return;
+    if (!("wakeLock" in navigator)) return;
+    let sentinel: WakeLockSentinel | null = null;
+    let disposed = false;
+
+    const acquire = async () => {
+      try {
+        const lock = await navigator.wakeLock.request("screen");
+        if (disposed) {
+          void lock.release().catch(() => undefined);
+          return;
+        }
+        sentinel = lock;
+      } catch {
+        // Wake lock denial is non-fatal; the watchdogs still protect the run.
+      }
+    };
+    void acquire();
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") void acquire();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      disposed = true;
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      void sentinel?.release().catch(() => undefined);
+    };
+  }, [serialStatus]);
+
   useEffect(() => {
     const previousStatus = previousLinkStatusRef.current;
     previousLinkStatusRef.current = link.status;
     if (previousStatus === "connected" && link.status !== "connected") {
       cancelPulse();
+      setActiveDirection(null);
+      keyStackRef.current = [];
       const safe = estopRef.current ? ESTOP_COMMAND : STOP_COMMAND;
       presentCommand({ command: safe, label: "STOP do mất serial", source: "safety" });
     }
@@ -389,12 +525,13 @@ export default function App() {
     if (mode !== "AUTO" || current.command.type === COMMAND_TYPE.STOP) return;
     const trackingSafe =
       tracking.status === "ready" &&
-      tracking.bothHandsPresent &&
-      tracking.live.setupStatus === "ready";
+      tracking.driveReady &&
+      tracking.live.setupStatus === "ready" &&
+      !tracking.live.stalled;
     if (trackingSafe) return;
     const timer = window.setTimeout(() => stopNow("STOP do mất tay hoặc camera"), HAND_LOSS_STOP_MS);
     return () => window.clearTimeout(timer);
-  }, [current.command.type, mode, stopNow, tracking.bothHandsPresent, tracking.live.setupStatus, tracking.status]);
+  }, [current.command.type, mode, stopNow, tracking.driveReady, tracking.live.setupStatus, tracking.live.stalled, tracking.status]);
 
   useEffect(() => () => cancelPulse(), [cancelPulse]);
 
@@ -407,6 +544,11 @@ export default function App() {
         onEstop={triggerEstop}
         onReset={() => void resetEstop()}
       />
+      {estopResetNote && (
+        <p className="rounded-[var(--radius-control)] border border-warn/40 bg-warn/10 px-3 py-2 text-[12px] text-warn">
+          {estopResetNote}
+        </p>
+      )}
       <CurrentCommand
         current={current.command}
         previous={previous?.command ?? null}
@@ -430,6 +572,8 @@ export default function App() {
         fps={tracking.fps}
         trackingStatus={tracking.status}
       />
+
+      <SafetyStrip link={link} estopLatched={estopLatched} />
 
       {link.status === "error" && link.error && (
         <div className="border-b border-stop/30 bg-stop/10 px-4 py-2 text-center text-[12px] text-stop">
@@ -465,8 +609,7 @@ export default function App() {
                 error={tracking.error}
                 live={tracking.live}
                 handPresent={tracking.handPresent}
-                bothHandsPresent={tracking.bothHandsPresent}
-                directionDeadZone={tracking.directionDeadZone}
+                driveReady={tracking.driveReady}
                 inferenceMs={tracking.inferenceMs}
                 pipelineLatencyMs={tracking.pipelineLatencyMs}
                 delegate={tracking.delegate}
@@ -494,6 +637,39 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {/* Sticky E-stop for touch layouts: the side-panel button scrolls away
+          on <lg, but the emergency control must never leave the screen. */}
+      <div
+        className="sticky bottom-0 z-50 border-t border-stop/30 bg-bg/90 px-3 pt-2 backdrop-blur-md lg:hidden"
+        style={{ paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 0.5rem)" }}
+      >
+        {estopLatched ? (
+          <button
+            type="button"
+            onClick={() => void resetEstop()}
+            disabled={link.status !== "connected" || resettingEstop}
+            title={
+              link.status === "connected"
+                ? undefined
+                : "Kết nối ESP1 trước khi reset E-stop"
+            }
+            className="flex min-h-12 w-full items-center justify-center gap-2 rounded-[var(--radius-control)] border border-stop/50 bg-stop/15 px-4 py-2.5 text-[13px] font-bold text-stop transition-[background-color,transform] hover:bg-stop/25 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-45"
+          >
+            <ArrowCounterClockwise size={17} />
+            {resettingEstop ? "Đang reset" : "Arm / Reset"}
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={triggerEstop}
+            className="flex min-h-12 w-full items-center justify-center gap-2 rounded-[var(--radius-control)] bg-stop px-4 py-2.5 text-[14px] font-bold text-white transition-[filter,transform] hover:brightness-110 active:scale-[0.99]"
+          >
+            <WarningOctagon size={20} weight="fill" />
+            E-STOP
+          </button>
+        )}
+      </div>
     </div>
   );
 }

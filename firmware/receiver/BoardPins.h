@@ -13,6 +13,24 @@ constexpr int LORA_DIO1 = 8;
 constexpr int LORA_RESET = 9;
 constexpr int LORA_BUSY = 14;
 
+// Discrete RF-switch control lines (RXEN/TXEN), mirroring the transmitter
+// header. Many SX1262 modules manage the antenna switch from DIO2 instead and
+// have no discrete RXEN/TXEN pins — the user must confirm their module. (The
+// transmitter currently assumes discrete RXEN/TXEN on pins 6/7.) Set
+// HAS_RF_SWITCH = true and fill in the pins only for modules with discrete
+// switch lines.
+constexpr bool HAS_RF_SWITCH = false;
+constexpr int LORA_RXEN = -1;  // TODO: set when HAS_RF_SWITCH = true.
+constexpr int LORA_TXEN = -1;  // TODO: set when HAS_RF_SWITCH = true.
+
+// Battery voltage sense for telemetry. Disabled by default (-1). To enable:
+// wire the pack through a resistor divider to an ADC1-capable pin (GPIO1..10
+// on ESP32-S3), set the pin number here and set BATTERY_DIVIDER_RATIO =
+// (R_top + R_bottom) / R_bottom. The firmware uses analogReadMilliVolts(),
+// so no manual attenuation calibration is needed.
+constexpr int BATTERY_ADC_PIN = -1;
+constexpr float BATTERY_DIVIDER_RATIO = 2.0F;
+
 // Two direction inputs plus one PWM input per motor. This works with TB6612FNG
 // and L298N-style drivers. STANDBY is used by TB6612FNG; set HAS_STANDBY false
 // for drivers without it and wire their enable pins as required.

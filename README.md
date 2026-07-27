@@ -15,21 +15,73 @@ ESP-NOW hay Bluetooth Classic. ESP32-S3 không hỗ trợ Bluetooth Classic.
 
 ## Trạng thái triển khai
 
-P0 đã có trong source:
+Đã có trong source:
 
 - Ba mode `AUTO`, `MANUAL`, `CALIBRATION`.
-- MediaPipe Hand Landmarker chạy trong worker, GPU trước/CPU fallback, tối đa
-  hai tay và không chặn React bằng `detectForVideo()`.
-- Xòe/nắm để gán role; tám hướng theo tâm tay; pinch ngón cái-trỏ để kéo và
-  thả để khóa tốc độ.
-- `STOP`, `DRIVE`, `DIRECT_PWM`, E-stop latch và chuỗi reset rõ ràng.
-- Dead-man cho pointer và W/A/S/D; Space dừng, Escape E-stop.
+- MediaPipe Hand Landmarker chạy trong worker, GPU trước/CPU fallback (worker
+  được recycle sang CPU sau 5 lỗi detect liên tiếp, và tự rebuild sang CPU khi
+  GPU chậm bất thường kéo dài), warm-up inference, frame downscale còn tối đa
+  360 px trước khi gửi, capture bằng `requestVideoFrameCallback` và không chặn
+  React bằng `detectForVideo()`.
+- **Bám định danh bàn tay qua frame** (`src/lib/handTracking.ts`): mỗi tay có
+  id ổn định, ghép theo vị trí dự đoán thay vì nửa màn hình, nên vai trò vẫn
+  dính vào đúng bàn tay khi hai tay đổi bên. Cú nhảy landmark vượt tốc độ khả
+  thi (14 span/giây) bị chặn thay vì bám theo, và điểm chất lượng 0..1 phải đạt
+  >= 0.5 trên **cả hai** tay thì xe mới chạy.
+- **Bù trễ**: tâm lòng bàn tay được ngoại suy theo vận tốc của chính nó bằng độ
+  trễ pipeline đo được, giới hạn cứng 45 ms và 0.15 span nên không thể tự sinh
+  ra lệnh.
+- Điều khiển cử chỉ **analog hoàn toàn**: độ dời lòng bàn tay so với anchor tự
+  re-center, lọc One-Euro, chuẩn hóa theo palm span, dead zone tròn có
+  hysteresis (vào 0.18 / ra 0.12 span), expo 0.3, full deflection ở 1.1 span.
+  Lòng/mu bàn tay gate chiều tiến/lùi bằng **pháp tuyến lòng bàn tay** (bất
+  biến với xoay trong mặt phẳng) kèm hysteresis; mã 8 hướng giờ chỉ để hiển
+  thị.
+- Tốc độ chỉnh bằng **pinch-drag tương đối**: chụm ngón cái-trỏ để "nắm"
+  slider, kéo dọc để chỉnh (500 đơn vị mỗi hand-span), thả để khóa. Đặt xong
+  có thể hạ tay tốc độ xuống — mức LIMIT được giữ và xe chạy bằng một tay điều
+  hướng, nên **tay điều hướng là dead-man duy nhất**.
+- **Telemetry ESP2 -> ESP1 -> web ~2 Hz** trong khe TDMA ngay sau mỗi control
+  packet: RSSI/SNR, packet loss, failsafe, battery, output hai motor và trạng
+  thái E-stop latch. UI hiển thị các giá trị này kèm cảnh báo khi telemetry cũ.
+- `STOP`, `DRIVE`, `DIRECT_PWM`, E-stop latch và chuỗi reset rõ ràng; reset
+  E-stop yêu cầu xe xác nhận qua telemetry khi telemetry còn tươi.
+- Dead-man cho pointer và W/A/S/D; Space dừng, Escape E-stop; wake lock giữ
+  màn hình sáng và heartbeat 20 Hz chạy bằng timer trong dedicated worker nên
+  tab ẩn không bị browser throttle.
 - Hai slider motor độc lập, tám nút thử motor và timed pulse 250-2000 ms.
-- Web Serial GD2 có CRC-16/CCITT, single writer và heartbeat 20 Hz.
-- ESP1 parser fixed-buffer non-blocking, host watchdog 225 ms và LoRa 20 Hz.
-- ESP2 CRC/sequence validation, mixer, gain, PWM minimum, ramp, radio watchdog
-  225 ms và disable driver sau 1 giây.
-- PlatformIO đã compile thành công cả hai environment cho ESP32-S3 generic.
+- Web Serial GD2 có CRC-16/CCITT, latest-wins TX (một write in-flight, một
+  slot pending thay thế được) với write timeout 300 ms và heartbeat 20 Hz.
+- ESP1 parser fixed-buffer non-blocking, host watchdog 225 ms, lịch LoRa 20 Hz
+  drift-free, TX watchdog 60 ms, retry radio init mỗi 2 s và `SEQUENCE_RESYNC`
+  sau 3 lần sequence bị loại liên tiếp.
+- ESP2 CRC/sequence validation, mixer, gain, PWM minimum, ramp, brake-on-stop
+  (short-brake TB6612 khi lệnh về 0), `esp_task_wdt` reboot về trạng thái an
+  toàn, E-stop latch giữ qua reset bằng RTC RAM, radio watchdog 225 ms và
+  disable driver sau 1 giây.
+- **Bảo vệ pin (tùy chọn)**: khi đã đấu divider vào `BATTERY_ADC_PIN`, ESP2
+  cảnh báo dưới `BATTERY_WARN_MV` và khóa motor sau 2 giây liên tục dưới
+  `BATTERY_CRITICAL_MV`. Khóa này giữ tới khi tắt nguồn.
+- **Chất lượng liên kết hai chiều**: ESP2 báo RSSI/SNR chiều trạm → xe, ESP1 tự
+  đo RSSI/SNR trên gói telemetry cho chiều xe → trạm. UI tính biên dự trữ theo
+  chiều yếu hơn.
+- Unit test firmware chạy trên máy dev (`pio test -e native`): CRC, khung
+  packet, số học sequence và toàn bộ drive math quyết định dòng vào motor.
+- Vendor MediaPipe offline bằng `npm run vendor:mediapipe` (tự chạy trước
+  `dev` và `build`); worker ưu tiên asset local trong `public/mediapipe/`,
+  fallback CDN khi thiếu.
+- CI GitHub Actions (`.github/workflows/ci.yml`): lint, typecheck, test, build
+  web và compile cả hai firmware environment bằng PlatformIO.
+
+### Các tầng watchdog
+
+| Tầng | Timeout | Hành động |
+| --- | ---: | --- |
+| AI-result (browser) | 350 ms | AI worker im lặng -> STOP + banner cảnh báo |
+| Chất lượng bám tay | tức thì | tay điều hướng quality < 0.5 hoặc đang bắt lại -> STOP |
+| Host (ESP1) | 225 ms | không có dòng GD2 hợp lệ -> phát STOP qua LoRa |
+| Radio (ESP2) | 225 ms | không có packet mới hợp lệ -> PWM 0 (short-brake) |
+| Motor disable (ESP2) | 1 s | mất radio kéo dài -> hạ STANDBY, motor coast |
 
 Chưa thể coi là hoàn tất phần cứng cho tới khi nhóm xác nhận pin, loại oscillator
 SX1262, wiring motor và chạy toàn bộ bài test trên bàn. Pin trong repo chỉ là ví
@@ -47,6 +99,8 @@ dụ compile được.
 | LoRa PHY CRC | Bật |
 | TX power | 5 dBm, mức thử bàn |
 | Control rate | 20 Hz |
+| Control airtime | 16 byte ≈ 25.7 ms |
+| Telemetry airtime | 12 byte ≈ 20.6 ms, reply ~2 Hz trong khe idle ~24 ms |
 
 Các giá trị nằm tập trung tại
 [`firmware/common/RadioConfig.h`](firmware/common/RadioConfig.h). Frequency và
@@ -64,10 +118,16 @@ npm run dev
 
 Sau đó mở URL Vite, cắm ESP1 bằng cáp USB dữ liệu và bấm **Kết nối ESP1**.
 
+`npm run dev` và `npm run build` tự chạy `npm run vendor:mediapipe` trước, để
+copy WASM từ `node_modules` và tải model `hand_landmarker.task` (~7.5 MB) vào
+`public/mediapipe/`. Script này bỏ qua êm khi offline; worker sẽ fallback CDN,
+vì vậy nên chạy nó một lần khi còn mạng trước buổi vận hành offline.
+
 Kiểm tra source:
 
 ```bash
 npm test
+npm run typecheck
 npm run build
 npm run lint
 ```
@@ -91,6 +151,13 @@ API và ví dụ interrupt chính thức nằm tại
 ```bash
 pio run -e esp1_transmitter
 pio run -e esp2_receiver
+```
+
+Unit test chạy ngay trên máy dev, không cần board — bao phủ CRC, khung packet,
+số học sequence và drive math (mixer, ramp, hiệu chỉnh bánh):
+
+```bash
+pio test -e native
 ```
 
 Nạp từng board, thay cổng serial bằng cổng thực tế:
@@ -126,6 +193,7 @@ src/components/          Manual, calibration, E-stop, link status
 firmware/common/         Packet, CRC, radio và timeout dùng chung
 firmware/transmitter/    ESP1 USB-to-LoRa
 firmware/receiver/       ESP2 LoRa-to-motor
+test/                    Unit test host-side cho firmware (pio test -e native)
 docs/                    Protocol, wiring, calibration, safety tests
 ```
 
@@ -144,11 +212,8 @@ source canonical bên dưới `firmware/`.
 
 ## P1 còn lại
 
-- Continuous gesture dùng EMA, deadzone/hysteresis đầy đủ.
-- Ghép role tay theo khoảng cách qua frame thay vì nửa màn hình.
-- Telemetry hai chiều 1-2 Hz gồm RSSI/SNR, packet loss, output và battery.
-- Đo packet loss end-to-end và biểu đồ thống kê dài hạn.
+- Biểu đồ thống kê dài hạn cho packet loss và latency.
 
-UI đã parse được dòng telemetry và export CSV, nhưng firmware chưa phát telemetry
-để giữ đường điều khiển P0 đơn giản. `LINK:LORA` hiện xác nhận SX1262 hoàn tất
-transmit, không phải ACK end-to-end từ ESP2.
+`LINK:LORA` xác nhận SX1262 của ESP1 hoàn tất transmit. Xác nhận end-to-end đến
+từ dòng `TELEMETRY:` mà ESP1 in ra sau khi nhận reply ~2 Hz của ESP2, kèm packet
+loss ESP2 tự đo giữa hai lần telemetry.

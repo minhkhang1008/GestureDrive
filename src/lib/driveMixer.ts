@@ -1,5 +1,10 @@
 import { clamp, applyRadialDeadzone } from "./filters";
 
+// Mirrors firmware/common/ConfigDefaults.h — keep in sync manually so the UI
+// output preview matches what ESP2 actually drives.
+export const FIRMWARE_MAX_PWM = 600;
+export const FIRMWARE_K_TURN = 0.7;
+
 export interface MotorPair {
   left: number;
   right: number;

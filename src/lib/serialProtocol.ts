@@ -1,14 +1,26 @@
-import type { ControlCommand } from "./controlTypes";
+import {
+  clampControl,
+  clampSpeedLimit,
+  type ControlCommand,
+} from "./controlTypes";
 
 const encoder = new TextEncoder();
 
 export interface Telemetry {
   sequence: number;
+  /** Downlink (station -> vehicle), measured by ESP2 on the control packet. */
   rssi: number;
   snr: number;
+  /** Uplink (vehicle -> station), measured by ESP1 on the telemetry reply. */
+  uplinkRssi: number | null;
+  uplinkSnr: number | null;
   packetLoss: number;
   failsafe: boolean;
   batteryMv: number | null;
+  /** Pack below the warning threshold; the vehicle still drives. */
+  batteryLow: boolean | null;
+  /** Under-voltage lockout latched on the vehicle: motors are cut. */
+  batteryCritical: boolean | null;
   leftOutput: number | null;
   rightOutput: number | null;
   estop: boolean | null;
@@ -36,14 +48,16 @@ export function crc16Ccitt(data: Uint8Array | string): number {
 }
 
 export function serializeCommand(command: ControlCommand, sequence: number): string {
+  // Defense in depth: an out-of-range or fractional field would poison every
+  // heartbeat line, so the serializer re-clamps instead of trusting callers.
   const body = [
     "GD2",
     sequence & 0xffff,
     command.type,
-    command.channelA,
-    command.channelB,
-    command.speedLimit,
-    command.flags,
+    clampControl(command.channelA),
+    clampControl(command.channelB),
+    clampSpeedLimit(command.speedLimit),
+    command.flags & 0xff,
   ].join(",");
   const crc = crc16Ccitt(body).toString(16).toUpperCase().padStart(4, "0");
   return `${body},${crc}\n`;
@@ -82,6 +96,10 @@ export function parseBridgeLine(input: string): BridgeEvent {
     const values = line.slice("TELEMETRY:".length).split(",");
     if (values.length >= 6) {
       const parsed = values.map(finiteNumber);
+      // Fields beyond the first six were added over time; a shorter line from
+      // older ESP1 firmware still parses, with the extras reported as unknown.
+      const optionalFlag = (value: number | null | undefined): boolean | null =>
+        value === null || value === undefined ? null : value === 1;
       if (parsed.slice(0, 6).every((value) => value !== null)) {
         return {
           kind: "telemetry",
@@ -91,10 +109,14 @@ export function parseBridgeLine(input: string): BridgeEvent {
             snr: parsed[2] ?? 0,
             packetLoss: parsed[3] ?? 0,
             failsafe: parsed[4] === 1,
-            batteryMv: parsed[5] === 0 ? null : parsed[5],
+            batteryMv: !parsed[5] ? null : parsed[5],
             leftOutput: parsed[6] ?? null,
             rightOutput: parsed[7] ?? null,
-            estop: parsed[8] === null || parsed[8] === undefined ? null : parsed[8] === 1,
+            estop: optionalFlag(parsed[8]),
+            uplinkRssi: parsed[9] ?? null,
+            uplinkSnr: parsed[10] ?? null,
+            batteryLow: optionalFlag(parsed[11]),
+            batteryCritical: optionalFlag(parsed[12]),
           },
         };
       }

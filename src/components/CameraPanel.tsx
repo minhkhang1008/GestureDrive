@@ -20,8 +20,7 @@ interface Props {
   error: string | null;
   live: LiveGesture;
   handPresent: boolean;
-  bothHandsPresent: boolean;
-  directionDeadZone: number;
+  driveReady: boolean;
   inferenceMs: number;
   pipelineLatencyMs: number;
   delegate: HandLandmarkerDelegate | null;
@@ -84,6 +83,22 @@ function RoleLabel({
   );
 }
 
+type ChipTone = "accent" | "neutral" | "warn" | "stop";
+
+const CHIP_BORDER: Record<ChipTone, string> = {
+  accent: "border-accent/50",
+  neutral: "border-white/10",
+  warn: "border-warn/60",
+  stop: "border-stop/60",
+};
+
+const CHIP_ICON: Record<ChipTone, string> = {
+  accent: "bg-accent/25 text-accent",
+  neutral: "bg-white/10 text-white/55",
+  warn: "bg-warn/20 text-warn",
+  stop: "bg-stop/25 text-stop",
+};
+
 export function CameraPanel({
   videoRef,
   canvasRef,
@@ -91,8 +106,7 @@ export function CameraPanel({
   error,
   live,
   handPresent,
-  bothHandsPresent,
-  directionDeadZone,
+  driveReady,
   inferenceMs,
   pipelineLatencyMs,
   delegate,
@@ -102,6 +116,21 @@ export function CameraPanel({
   const ready = status === "ready";
   const command = live.code ? COMMANDS[live.code] : null;
   const speedTop = `${(1 - live.speed / 1000) * 100}%`;
+
+  // Gesture chip state: accent while driving, neutral while resting in the
+  // dead zone, amber for recoverable pose warnings (name carries the reason),
+  // red whenever a safety condition has stopped the vehicle.
+  const chipTone: ChipTone = (() => {
+    if (mode !== "AUTO" || !ready) return "neutral";
+    if (live.stalled) return "stop";
+    const rolesSet = live.setupStatus === "ready";
+    if (!rolesSet) return "neutral";
+    if (!handPresent || !driveReady) return "stop";
+    if (live.reacquiring) return "stop";
+    if (!live.orientationValid) return "warn";
+    if (live.code && live.code !== "S") return "accent";
+    return "neutral";
+  })();
 
   return (
     <section className="flex flex-col rounded-[var(--radius-panel)] border border-line bg-surface p-4">
@@ -187,6 +216,21 @@ export function CameraPanel({
               </div>
             )}
 
+            {mode === "AUTO" && live.stalled && (
+              <div className="absolute inset-x-0 top-0 bg-stop px-4 py-1.5 text-center text-[11px] font-bold text-white">
+                AI không phản hồi — xe đã dừng
+              </div>
+            )}
+
+            {/* A rejected landmark jump: the tracker is rebuilding confidence
+                in where the hand actually is, and refuses to drive until it
+                has. Distinct from a stall, which means no results at all. */}
+            {mode === "AUTO" && !live.stalled && live.reacquiring && (
+              <div className="absolute inset-x-0 top-0 bg-stop px-4 py-1.5 text-center text-[11px] font-bold text-white">
+                Đang bắt lại bàn tay — xe đã dừng
+              </div>
+            )}
+
             {mode === "AUTO" && live.setupStatus !== "ready" && (
               <div className="absolute left-1/2 top-14 w-[min(88%,430px)] -translate-x-1/2 rounded-[var(--radius-control)] border border-accent/30 bg-black/65 px-4 py-3 text-center backdrop-blur-sm">
                 <p className="text-[13px] font-semibold text-white">{live.name}</p>
@@ -198,30 +242,21 @@ export function CameraPanel({
 
             {mode === "AUTO" && live.setupStatus === "ready" && live.controlAnchor && (
               <>
-                <span
-                  className="pointer-events-none absolute -translate-x-1/2 -translate-y-1/2 rounded-full border border-dashed border-accent/70 bg-accent/10"
-                  style={{
-                    left: `${live.controlAnchor.x * 100}%`,
-                    top: `${live.controlAnchor.y * 100}%`,
-                    width: `${directionDeadZone * 200}%`,
-                    aspectRatio: "1",
-                  }}
-                  aria-hidden="true"
-                />
-
+                {/* Anchor, dead zone and displacement vector are drawn on the
+                    overlay canvas itself so they stay video-aligned. */}
                 <div
                   className={`absolute bottom-[14%] top-[14%] w-8 rounded-full border border-white/15 bg-black/45 backdrop-blur-sm ${
                     live.roles?.speed === "left" ? "left-4" : "right-4"
                   }`}
                 >
-                  <span className="absolute left-1/2 top-2 -translate-x-1/2 text-[8px] font-medium text-white/45">
+                  <span className="absolute left-1/2 top-2 -translate-x-1/2 text-[10px] font-medium text-white/55">
                     MAX
                   </span>
-                  <span className="absolute bottom-2 left-1/2 -translate-x-1/2 text-[8px] font-medium text-white/45">
+                  <span className="absolute bottom-2 left-1/2 -translate-x-1/2 text-[10px] font-medium text-white/55">
                     0
                   </span>
                   <span
-                    className="absolute left-1/2 size-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-accent transition-[top] duration-75"
+                    className="absolute left-1/2 size-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-accent"
                     style={{ top: speedTop }}
                   />
                 </div>
@@ -229,11 +264,11 @@ export function CameraPanel({
             )}
 
             <div className="absolute inset-x-3 bottom-3 flex items-end justify-between gap-3">
-              <div className="flex min-w-0 items-center gap-2.5 rounded-[var(--radius-control)] border border-white/10 bg-black/55 px-2.5 py-2 backdrop-blur-sm">
+              <div
+                className={`flex min-w-0 items-center gap-2.5 rounded-[var(--radius-control)] border bg-black/55 px-2.5 py-2 backdrop-blur-sm ${CHIP_BORDER[chipTone]}`}
+              >
                 <span
-                  className={`grid size-8 shrink-0 place-items-center rounded-lg ${
-                    command ? "bg-accent/20 text-accent" : "bg-white/10 text-white/50"
-                  }`}
+                  className={`grid size-8 shrink-0 place-items-center rounded-lg ${CHIP_ICON[chipTone]}`}
                 >
                   {command ? (
                     <CommandGlyph code={command.code} size={18} />
@@ -250,7 +285,13 @@ export function CameraPanel({
                         : "Không thấy bàn tay"}
                   </p>
                   <p className="font-mono text-[10px] leading-tight text-white/55">
-                    {live.handCount}/2 tay, ổn định {Math.round(live.confidence * 100)}%
+                    {live.handCount}/2 tay · ổn định {Math.round(live.confidence * 100)}%
+                    {live.setupStatus === "ready" &&
+                      ` · bám tay ${Math.round(live.quality * 100)}%`}
+                    {live.setupStatus === "ready" &&
+                      ` · ga ${live.throttle > 0 ? "+" : ""}${live.throttle} · lái ${
+                        live.steering > 0 ? "+" : ""
+                      }${live.steering}`}
                   </p>
                 </div>
               </div>
@@ -266,14 +307,14 @@ export function CameraPanel({
                     <p className="font-mono text-[12px] font-semibold text-white">
                       LIMIT {live.speed}
                     </p>
-                    <p className="text-[9px] text-white/50">
-                      {!bothHandsPresent
-                        ? "Thiếu tay"
-                        : live.speedState === "adjusting"
-                          ? "Đang kéo"
-                          : live.speedLocked
-                            ? "Đã khóa"
-                            : "Chưa đúng cử chỉ"}
+                    <p className="text-[10px] text-white/55">
+                      {live.speedState === "adjusting"
+                        ? "Đang kéo"
+                        : live.speedState === "absent"
+                          ? "Giữ mức (không thấy tay)"
+                          : live.speedState === "invalid"
+                            ? "Giữ mức (sai cử chỉ)"
+                            : "Đã khóa"}
                     </p>
                   </div>
                 </div>

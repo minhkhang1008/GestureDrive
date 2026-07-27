@@ -13,6 +13,9 @@ dist-ssr
 .pio
 *.local
 
+# Vendored MediaPipe assets (created at build time by scripts/vendor-mediapipe.mjs)
+public/mediapipe/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -22,5 +25,5 @@ dist-ssr
 *.ntvs*
 *.njsproj
 *.sln
-*.sw
+*.sw?
 .claude

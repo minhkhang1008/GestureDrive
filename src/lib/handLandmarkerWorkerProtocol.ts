@@ -16,7 +16,7 @@ export interface HandTrackingFrame {
 }
 
 export type HandLandmarkerWorkerRequest =
-  | { type: "initialize" }
+  | { type: "initialize"; preferCpu?: boolean }
   | {
       type: "detect";
       frame: ImageBitmap;

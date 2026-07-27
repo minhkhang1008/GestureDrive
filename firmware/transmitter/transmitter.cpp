@@ -10,6 +10,7 @@
 #include "../common/ConfigDefaults.h"
 #include "../common/DriveProtocol.h"
 #include "../common/RadioConfig.h"
+#include "../common/TelemetryProtocol.h"
 
 using namespace gesturedrive;
 
@@ -18,8 +19,22 @@ namespace {
 constexpr size_t HOST_LINE_CAPACITY = 96;
 constexpr size_t HOST_BYTES_PER_LOOP = 64;
 constexpr uint8_t RADIO_FAILURES_BEFORE_LINK_DOWN = 3;
-constexpr uint32_t RADIO_OPERATION_TIMEOUT_MS = 250;
+// Control airtime at SF7/BW250/CR4:5 with a 16-byte payload is ~25.7 ms;
+// 60 ms is a generous 2x margin including IRQ latency, and still shorter than
+// the 50 ms slot plus one interval, so a lost TX-done cannot stall the 20 Hz
+// schedule for long.
+constexpr uint32_t RADIO_OPERATION_TIMEOUT_MS = 60;
+constexpr uint32_t RADIO_INIT_RETRY_MS = 2000;
+constexpr uint8_t SEQUENCE_REJECTS_BEFORE_RESYNC = 3;
 uint32_t nextStatusReportMs = 0;
+
+// RadioLib's DIO1 line is shared by TX-done and RX-done. A single latched flag
+// is interpreted in loop() according to this explicit state.
+enum class RadioState : uint8_t {
+  IDLE,            // nothing armed
+  TX_IN_PROGRESS,  // control transmit running
+  RX_ARMED,        // listening for the telemetry reply in the idle gap
+};
 
 SX1262 radio = new Module(transmitter_pins::LORA_NSS,
                           transmitter_pins::LORA_DIO1,
@@ -37,26 +52,49 @@ uint16_t radioSequence = 0;
 bool hasHostSequence = false;
 bool hostTimedOut = true;
 uint32_t lastValidHostMs = 0;
+uint8_t consecutiveSequenceRejects = 0;
 
 bool radioReady = false;
-bool radioTxInProgress = false;
 bool linkReportedUp = false;
 uint8_t consecutiveRadioFailures = 0;
 uint8_t radioTxReportDivider = 0;
 uint32_t radioTxStartedMs = 0;
 uint32_t nextRadioTxMs = 0;
+uint32_t nextRadioInitRetryMs = 0;
 int16_t radioStartState = RADIOLIB_ERR_NONE;
-volatile bool radioTxDone = false;
+int16_t lastRadioErrorCode = RADIOLIB_ERR_NONE;
+RadioState radioState = RadioState::IDLE;
+// DIO1 is edge-triggered and shared by TX-done and RX-done. A plain bool flag
+// loses an event whenever the ISR fires between the loop's test and its clear,
+// which would stall the 20 Hz schedule until the operation timeout. A
+// monotonic counter written only by the ISR cannot lose an edge.
+volatile uint32_t dio1Events = 0;
+uint32_t dio1Handled = 0;
 
 #if defined(ESP32)
 IRAM_ATTR
 #endif
-void onRadioPacketSent() {
-  radioTxDone = true;
+void onDio1() {
+  ++dio1Events;
 }
+
+/** True once per DIO1 edge; never loses an edge to a test/clear race. */
+bool consumeDio1Event() {
+  const uint32_t observed = dio1Events;
+  if (observed == dio1Handled) return false;
+  dio1Handled = observed;
+  return true;
+}
+
+/** Drops any pending edge before starting a new radio operation. */
+void discardDio1Events() { dio1Handled = dio1Events; }
 
 bool parseLongStrict(const char* text, long minimum, long maximum, long& value) {
   if (text == nullptr || *text == '\0') return false;
+  // strtol accepts leading whitespace and '+'; the wire format does not. The
+  // first character must be a digit, or '-' followed by a digit.
+  const char* digits = (*text == '-') ? text + 1 : text;
+  if (*digits < '0' || *digits > '9') return false;
   errno = 0;
   char* end = nullptr;
   const long parsed = strtol(text, &end, 10);
@@ -168,10 +206,20 @@ void acceptHostLine(char* line) {
   // zero can recover without waiting for the previous 16-bit value to wrap.
   if (hasHostSequence && !hostTimedOut &&
       !isSequenceNewer(sequence, latestHostSequence)) {
-    reportHostError(F("SEQUENCE"));
+    // Repeated rejections mean a new browser session started without a host
+    // timeout in between; drop the sequence lock instead of stalling.
+    if (consecutiveSequenceRejects < 255U) ++consecutiveSequenceRejects;
+    if (consecutiveSequenceRejects >= SEQUENCE_REJECTS_BEFORE_RESYNC) {
+      hasHostSequence = false;
+      consecutiveSequenceRejects = 0;
+      reportHostError(F("SEQUENCE_RESYNC"));
+    } else {
+      reportHostError(F("SEQUENCE"));
+    }
     return;
   }
 
+  consecutiveSequenceRejects = 0;
   latestHostSequence = sequence;
   hasHostSequence = true;
   latestCommand = parsed;
@@ -217,10 +265,15 @@ void setLinkReported(bool up) {
   Serial.println(up ? F("LINK:LORA") : F("LINK:NONE"));
 }
 
-void reportRadioFailure(int16_t code) {
-  if (consecutiveRadioFailures < 255U) ++consecutiveRadioFailures;
+void printRadioError(int16_t code) {
+  lastRadioErrorCode = code;
   Serial.print(F("RADIO_ERROR:"));
   Serial.println(code);
+}
+
+void reportRadioFailure(int16_t code) {
+  if (consecutiveRadioFailures < 255U) ++consecutiveRadioFailures;
+  printRadioError(code);
   if (consecutiveRadioFailures >= RADIO_FAILURES_BEFORE_LINK_DOWN) {
     setLinkReported(false);
   }
@@ -240,24 +293,103 @@ bool initializeRadio() {
     reportRadioFailure(state);
     return false;
   }
-  radio.setRfSwitchPins(
-    transmitter_pins::LORA_RXEN,
-    transmitter_pins::LORA_TXEN
-);
+  // Many SX1262 modules switch the antenna via DIO2 (no discrete RXEN/TXEN);
+  // only boards with discrete switch lines set HAS_RF_SWITCH in BoardPins.h.
+  if (transmitter_pins::HAS_RF_SWITCH) {
+    radio.setRfSwitchPins(transmitter_pins::LORA_RXEN,
+                          transmitter_pins::LORA_TXEN);
+  }
 
   const int16_t crcState = radio.setCRC(radio_config::PHY_CRC_ENABLED);
   if (crcState != RADIOLIB_ERR_NONE) {
     reportRadioFailure(crcState);
     return false;
   }
-  radio.setPacketSentAction(onRadioPacketSent);
+  radio.setDio1Action(onDio1);
+  radioState = RadioState::IDLE;
   return true;
 }
 
+// Exact format consumed by parseBridgeLine in src/lib/serialProtocol.ts.
+//
+// The packet carries the vehicle's view of the downlink (station -> vehicle);
+// uplinkRssi/uplinkSnr are ESP1's own measurement of the telemetry reply, i.e.
+// the vehicle -> station direction. Reporting both makes an asymmetric link
+// (a deaf receiver, a detuned antenna on one end) visible instead of guessed.
+void printTelemetryLine(const TelemetryPacket& packet, float uplinkRssi,
+                        float uplinkSnr) {
+  const uint8_t flags = telemetryFlags(packet);
+  Serial.print(F("TELEMETRY:"));
+  Serial.print(packet.sequence);
+  Serial.print(',');
+  Serial.print(static_cast<int>(packet.rssiDbm));
+  Serial.print(',');
+  Serial.print(static_cast<float>(packet.snrDbX4) / 4.0F, 2);
+  Serial.print(',');
+  Serial.print(packet.lossPercent);
+  Serial.print(',');
+  Serial.print((flags & TELEMETRY_FLAG_FAILSAFE) != 0U ? 1 : 0);
+  Serial.print(',');
+  const uint32_t batteryMv =
+      (flags & TELEMETRY_FLAG_BATTERY_VALID) != 0U
+          ? static_cast<uint32_t>(packet.battery50mV) * 50U
+          : 0U;  // 0 means unknown on the web side
+  Serial.print(batteryMv);
+  Serial.print(',');
+  Serial.print(static_cast<int>(packet.leftPermilleDiv10) * 10);
+  Serial.print(',');
+  Serial.print(static_cast<int>(packet.rightPermilleDiv10) * 10);
+  Serial.print(',');
+  Serial.print((flags & TELEMETRY_FLAG_ESTOP_LATCHED) != 0U ? 1 : 0);
+  Serial.print(',');
+  Serial.print(uplinkRssi, 1);
+  Serial.print(',');
+  Serial.print(uplinkSnr, 2);
+  Serial.print(',');
+  Serial.print((flags & TELEMETRY_FLAG_BATTERY_LOW) != 0U ? 1 : 0);
+  Serial.print(',');
+  Serial.println((flags & TELEMETRY_FLAG_BATTERY_CRITICAL) != 0U ? 1 : 0);
+}
+
+// Opens the receive window for the ESP2 telemetry reply during the ~24 ms
+// idle gap between control transmissions.
+void armTelemetryReceive() {
+  discardDio1Events();  // drop any stale edge before a new operation
+  const int16_t state = radio.startReceive();
+  if (state != RADIOLIB_ERR_NONE) {
+    // Stay IDLE; the next control TX slot recovers the radio state.
+    reportRadioFailure(state);
+    return;
+  }
+  radioState = RadioState::RX_ARMED;
+}
+
+void processTelemetryReception() {
+  const size_t packetLength = radio.getPacketLength();
+  uint8_t buffer[64];
+  const size_t readLength = packetLength > sizeof(buffer) ? sizeof(buffer)
+                                                          : packetLength;
+  const int16_t state = radio.readData(buffer, readLength);
+  if (state == RADIOLIB_ERR_NONE && packetLength == sizeof(TelemetryPacket)) {
+    TelemetryPacket packet;
+    memcpy(&packet, buffer, sizeof(packet));
+    if (isTelemetryShapeValid(packet) && hasValidTelemetryCrc(packet)) {
+      // Measured before re-arming the receiver: these registers describe the
+      // packet that was just read out.
+      printTelemetryLine(packet, radio.getRSSI(), radio.getSNR());
+    }
+  } else if (state != RADIOLIB_ERR_NONE &&
+             state != RADIOLIB_ERR_CRC_MISMATCH) {
+    // A corrupted reception must not tear the control link status down, so
+    // this bypasses the consecutive-failure counter.
+    printRadioError(state);
+  }
+  armTelemetryReceive();
+}
+
 void finishRadioTransmit() {
-  radioTxDone = false;
   const int16_t finishState = radio.finishTransmit();
-  radioTxInProgress = false;
+  radioState = RadioState::IDLE;
   if (radioStartState != RADIOLIB_ERR_NONE || finishState != RADIOLIB_ERR_NONE) {
     reportRadioFailure(radioStartState != RADIOLIB_ERR_NONE ? radioStartState
                                                             : finishState);
@@ -268,48 +400,76 @@ void finishRadioTransmit() {
   setLinkReported(true);
   // Radio vẫn phát ở 20 Hz, nhưng chỉ gửi log trạng thái về frontend ở 2 Hz.
   radioTxReportDivider++;
-  
+
   if (radioTxReportDivider >= 10U) {
     radioTxReportDivider = 0;
 
     Serial.print(F("RADIO_TX:"));
     Serial.println(inFlightPacket.sequence);
   }
+
+  // The control TX completed, so ESP2 replies now: listen for telemetry until
+  // the next control slot.
+  armTelemetryReceive();
 }
 
 void serviceRadio(uint32_t now) {
-  if (!radioReady) return;
+  if (!radioReady) {
+    // A radio init failure must not be permanent (loose SPI wiring fixed in
+    // the field, brownout during boot, ...): keep retrying every 2 s.
+    if (static_cast<int32_t>(now - nextRadioInitRetryMs) < 0) return;
+    nextRadioInitRetryMs = now + RADIO_INIT_RETRY_MS;
+    radioReady = initializeRadio();
+    if (!radioReady) return;
+    nextRadioTxMs = now;  // realign the 20 Hz schedule after recovery
+  }
 
-  if (radioTxInProgress) {
-    if (radioTxDone) {
+  if (radioState == RadioState::TX_IN_PROGRESS) {
+    if (consumeDio1Event()) {
       finishRadioTransmit();
     } else if (now - radioTxStartedMs > RADIO_OPERATION_TIMEOUT_MS) {
+      discardDio1Events();  // a late edge must not leak into the next operation
       radio.finishTransmit();
-      radioTxInProgress = false;
+      radioState = RadioState::IDLE;
       reportRadioFailure(-1000);
     }
     return;
   }
 
+  if (radioState == RadioState::RX_ARMED && consumeDio1Event()) {
+    processTelemetryReception();
+  }
+
   if (static_cast<int32_t>(now - nextRadioTxMs) < 0) return;
-  nextRadioTxMs = now + config::CONTROL_INTERVAL_MS;
+  // Drift-free 20 Hz schedule: advance by the interval, not from "now".
+  nextRadioTxMs += config::CONTROL_INTERVAL_MS;
+  // Catch-up clamp: when more than one interval behind (blocked loop, radio
+  // recovery), realign instead of bursting transmissions to chase the old
+  // schedule.
+  if (static_cast<int32_t>(now - nextRadioTxMs) >= 0) {
+    nextRadioTxMs = now + config::CONTROL_INTERVAL_MS;
+  }
 
   inFlightPacket = latestCommand;
   inFlightPacket.sequence = static_cast<uint16_t>(radioSequence + 1U);
   radioSequence = inFlightPacket.sequence;
   finalizePacket(inFlightPacket);
 
-  radioTxDone = false;
+  // Leave the telemetry listen window (or any stale state) before TX.
+  radio.standby();
+  discardDio1Events();  // drop any stale edge before a new operation
   radioStartState = radio.startTransmit(
       reinterpret_cast<const uint8_t*>(&inFlightPacket), sizeof(inFlightPacket));
   if (radioStartState != RADIOLIB_ERR_NONE) {
+    radioState = RadioState::IDLE;
     reportRadioFailure(radioStartState);
     return;
   }
-  radioTxInProgress = true;
+  radioState = RadioState::TX_IN_PROGRESS;
   radioTxStartedMs = now;
 }
-  void serviceStatusReport(uint32_t now) {
+
+void serviceStatusReport(uint32_t now) {
   if (static_cast<int32_t>(now - nextStatusReportMs) < 0) {
     return;
   }
@@ -319,6 +479,12 @@ void serviceRadio(uint32_t now) {
   Serial.println(linkReportedUp ? F("LINK:LORA") : F("LINK:NONE"));
   Serial.println(hostTimedOut ? F("HOST_TIMEOUT:1")
                               : F("HOST_TIMEOUT:0"));
+  // While the radio never initialized, re-emit the last error code once per
+  // second so a web client that opens the port later still sees the fault.
+  if (!radioReady && lastRadioErrorCode != RADIOLIB_ERR_NONE) {
+    Serial.print(F("RADIO_ERROR:"));
+    Serial.println(lastRadioErrorCode);
+  }
 }
 
 void serviceHostTimeout(uint32_t now) {
@@ -336,6 +502,7 @@ void setup() {
   Serial.println(F("HOST_TIMEOUT:1"));
   Serial.println(F("LINK:NONE"));
   radioReady = initializeRadio();
+  nextRadioInitRetryMs = millis() + RADIO_INIT_RETRY_MS;
   nextRadioTxMs = millis();
 }
 

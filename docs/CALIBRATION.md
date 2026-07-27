@@ -34,6 +34,18 @@ PWM_MIN_RIGHT_REV
 Giá trị mặc định bằng 0 vì chưa có số đo thật, không phải vì motor quay được ở
 0%.
 
+Cách firmware áp dụng các giá trị này (`MotorController.h`):
+
+- **Ramp-then-calibrate**: ramp chạy trong miền command thuần (-1000..1000 đã
+  mix và scale theo speedLimit). Invert, gain, clamp `MAX_PWM` và breakaway
+  floor được áp **tại thời điểm ghi PWM**, sau ramp, để hiệu chỉnh từng bánh
+  không làm méo đường ramp chuyển động.
+- **Engage deadband**: |command| < 20 sau ramp bị đưa về 0, để nhiễu quanh 0
+  không nhảy qua lại ngang breakaway floor.
+- **Breakaway remap**: trên deadband, magnitude được remap tuyến tính từ
+  `[floor .. MAX_PWM]`, tức mọi command khác 0 đều bắt đầu từ mức motor thực
+  sự quay được.
+
 ## 3. Cân gain
 
 1. Kê bánh, gửi cùng command cho hai motor.

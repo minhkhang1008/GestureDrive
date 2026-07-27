@@ -15,6 +15,8 @@ export interface BridgeState {
   radioError: number | null;
   hostError: string | null;
   telemetry: Telemetry | null;
+  /** performance.now() when the last TELEMETRY line arrived. */
+  telemetryReceivedAt: number | null;
 }
 
 export interface SerialLink {
@@ -31,13 +33,25 @@ export interface SerialLink {
 }
 
 const BAUD_RATE = 115200;
+/** A serial write slower than this means the port is wedged, not busy. */
+const WRITE_TIMEOUT_MS = 300;
+/** Newline-free garbage larger than this is dropped instead of buffered. */
+const READ_BUFFER_LIMIT = 4096;
+
 const INITIAL_BRIDGE_STATE: BridgeState = {
   hostTimeout: false,
   lastRadioSequence: null,
   radioError: null,
   hostError: null,
   telemetry: null,
+  telemetryReceivedAt: null,
 };
+
+interface PendingWrite {
+  payload: Uint8Array;
+  sequence: number;
+  resolve: (sequence: number | null) => void;
+}
 
 export function useSerialConnection(): SerialLink {
   const [status, setStatus] = useState<LinkStatus>("disconnected");
@@ -52,7 +66,13 @@ export function useSerialConnection(): SerialLink {
   const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
   const sequenceRef = useRef(0);
   const closingRef = useRef(false);
-  const writeQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const connectingRef = useRef(false);
+  const epochRef = useRef(0);
+  // Latest-wins TX: one write in flight, one replaceable pending slot. The 20
+  // Hz heartbeat plus gesture updates coalesce naturally, and a wedged port
+  // can never grow an unbounded queue of stale movement commands.
+  const writeInFlightRef = useRef(false);
+  const pendingWriteRef = useRef<PendingWrite | null>(null);
   const disconnectHandlerRef = useRef<(() => void) | null>(null);
   const encoderRef = useRef(new TextEncoder());
   const lastSentUiUpdateRef = useRef(0);
@@ -75,13 +95,11 @@ export function useSerialConnection(): SerialLink {
     }
     if (event.kind === "radio-tx") {
       setTransport("lora");
-    
       setBridge((current) => ({
         ...current,
         lastRadioSequence: event.sequence,
         radioError: null,
       }));
-    
       return;
     }
     if (event.kind === "radio-error") {
@@ -93,18 +111,27 @@ export function useSerialConnection(): SerialLink {
       return;
     }
     if (event.kind === "telemetry") {
-      setBridge((current) => ({ ...current, telemetry: event.value }));
+      setBridge((current) => ({
+        ...current,
+        telemetry: event.value,
+        telemetryReceivedAt: performance.now(),
+      }));
     }
   }, []);
 
-  const cleanup = useCallback(async () => {
+  const cleanup = useCallback(async (epoch: number) => {
+    if (epoch !== epochRef.current) return;
     closingRef.current = true;
+
     const port = portRef.current;
     const handler = disconnectHandlerRef.current;
     if (port && handler) port.removeEventListener("disconnect", handler);
     disconnectHandlerRef.current = null;
 
-    await writeQueueRef.current.catch(() => undefined);
+    const pending = pendingWriteRef.current;
+    pendingWriteRef.current = null;
+    pending?.resolve(null);
+
     try {
       await readerRef.current?.cancel();
     } catch {
@@ -127,9 +154,21 @@ export function useSerialConnection(): SerialLink {
     } catch {
       // Ignore close errors after unplugging the USB cable.
     }
-    portRef.current = null;
-    closingRef.current = false;
+    if (epoch === epochRef.current) {
+      portRef.current = null;
+      closingRef.current = false;
+    }
   }, []);
+
+  const failLink = useCallback(
+    (reason: unknown) => {
+      if (closingRef.current) return;
+      setError(reason instanceof Error ? reason.message : String(reason));
+      setStatus("error");
+      void cleanup(epochRef.current);
+    },
+    [cleanup],
+  );
 
   const readBridge = useCallback(
     async (reader: ReadableStreamDefaultReader<Uint8Array>) => {
@@ -142,13 +181,11 @@ export function useSerialConnection(): SerialLink {
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split(/\r?\n/);
           buffer = lines.pop() ?? "";
+          if (buffer.length > READ_BUFFER_LIMIT) buffer = "";
           lines.forEach(handleBridgeLine);
         }
       } catch (reason) {
-        if (!closingRef.current) {
-          setError(reason instanceof Error ? reason.message : String(reason));
-          setStatus("error");
-        }
+        failLink(reason);
       } finally {
         try {
           reader.releaseLock();
@@ -158,8 +195,57 @@ export function useSerialConnection(): SerialLink {
         if (readerRef.current === reader) readerRef.current = null;
       }
     },
-    [handleBridgeLine],
+    [failLink, handleBridgeLine],
   );
+
+  const pumpWrites = useCallback(() => {
+    if (writeInFlightRef.current) return;
+    const pending = pendingWriteRef.current;
+    if (!pending) return;
+    pendingWriteRef.current = null;
+
+    const writer = writerRef.current;
+    if (!writer || closingRef.current) {
+      pending.resolve(null);
+      return;
+    }
+
+    writeInFlightRef.current = true;
+    let settled = false;
+    const timeout = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      writeInFlightRef.current = false;
+      pending.resolve(null);
+      failLink(new Error(`Ghi serial quá ${WRITE_TIMEOUT_MS} ms — cổng bị kẹt.`));
+    }, WRITE_TIMEOUT_MS);
+
+    writer.write(pending.payload).then(
+      () => {
+        window.clearTimeout(timeout);
+        if (settled) return;
+        settled = true;
+        writeInFlightRef.current = false;
+
+        const now = performance.now();
+        // Serial vẫn gửi 20 Hz nhưng UI chỉ render lại tối đa 4 Hz.
+        if (now - lastSentUiUpdateRef.current >= 250) {
+          lastSentUiUpdateRef.current = now;
+          setLastSentSequence(pending.sequence);
+        }
+        pending.resolve(pending.sequence);
+        pumpWrites();
+      },
+      (reason) => {
+        window.clearTimeout(timeout);
+        if (settled) return;
+        settled = true;
+        writeInFlightRef.current = false;
+        pending.resolve(null);
+        failLink(reason);
+      },
+    );
+  }, [failLink]);
 
   const writeCommand = useCallback(
     (command: ControlCommand): Promise<number | null> => {
@@ -168,37 +254,13 @@ export function useSerialConnection(): SerialLink {
       const payload = encoderRef.current.encode(serializeCommand(command, sequence));
 
       return new Promise((resolve) => {
-        writeQueueRef.current = writeQueueRef.current
-          .catch(() => undefined)
-          .then(async () => {
-            const writer = writerRef.current;
-            if (!writer || closingRef.current) {
-              resolve(null);
-              return;
-            }
-            try {
-              await writer.write(payload);
-
-              const now = performance.now();
-
-              // Serial vẫn gửi 20 Hz nhưng UI chỉ render lại tối đa 4 Hz.
-              if (now - lastSentUiUpdateRef.current >= 250) {
-                lastSentUiUpdateRef.current = now;
-                setLastSentSequence(sequence);
-              }
-
-              resolve(sequence);
-            } catch (reason) {
-              if (!closingRef.current) {
-                setError(reason instanceof Error ? reason.message : String(reason));
-                setStatus("error");
-              }
-              resolve(null);
-            }
-          });
+        const superseded = pendingWriteRef.current;
+        pendingWriteRef.current = { payload, sequence, resolve };
+        superseded?.resolve(null);
+        pumpWrites();
       });
     },
-    [],
+    [pumpWrites],
   );
 
   const connect = useCallback(async () => {
@@ -207,11 +269,22 @@ export function useSerialConnection(): SerialLink {
       setStatus("error");
       return;
     }
-    setError(null);
-    setTransport("unknown");
-    setBridge(INITIAL_BRIDGE_STATE);
-    setStatus("connecting");
+    if (connectingRef.current) return;
+    connectingRef.current = true;
+
     try {
+      // A previous half-open connection must be fully released first.
+      if (portRef.current) await cleanup(epochRef.current);
+
+      setError(null);
+      setTransport("unknown");
+      setBridge(INITIAL_BRIDGE_STATE);
+      setStatus("connecting");
+
+      const epoch = epochRef.current + 1;
+      epochRef.current = epoch;
+      closingRef.current = false;
+
       const port = await navigator.serial.requestPort();
       await port.open({ baudRate: BAUD_RATE });
       const writer = port.writable?.getWriter();
@@ -222,6 +295,8 @@ export function useSerialConnection(): SerialLink {
       writerRef.current = writer;
       readerRef.current = reader;
       sequenceRef.current = 0;
+      writeInFlightRef.current = false;
+      pendingWriteRef.current = null;
       lastSentUiUpdateRef.current = 0;
       setLastSentSequence(null);
       const info = port.getInfo();
@@ -235,7 +310,7 @@ export function useSerialConnection(): SerialLink {
         setStatus("disconnected");
         setTransport("unknown");
         setPortName(null);
-        void cleanup();
+        void cleanup(epoch);
       };
       disconnectHandlerRef.current = onDisconnect;
       port.addEventListener("disconnect", onDisconnect);
@@ -249,15 +324,20 @@ export function useSerialConnection(): SerialLink {
       }
       setError(message);
       setStatus("error");
-      await cleanup();
+      await cleanup(epochRef.current);
+    } finally {
+      connectingRef.current = false;
     }
   }, [cleanup, readBridge]);
 
   const disconnect = useCallback(async () => {
-    // Stop accepting queued heartbeats, let already queued writes drain/skip,
-    // then make STOP the final write before releasing the port.
+    // Stop accepting new writes, then make STOP the final line on the wire
+    // before releasing the port.
     closingRef.current = true;
-    await writeQueueRef.current.catch(() => undefined);
+    const superseded = pendingWriteRef.current;
+    pendingWriteRef.current = null;
+    superseded?.resolve(null);
+
     const writer = writerRef.current;
     if (writer) {
       const sequence = (sequenceRef.current + 1) & 0xffff;
@@ -271,7 +351,7 @@ export function useSerialConnection(): SerialLink {
         // A physical unplug can make the best-effort final STOP impossible.
       }
     }
-    await cleanup();
+    await cleanup(epochRef.current);
     setStatus("disconnected");
     setTransport("unknown");
     setPortName(null);
@@ -279,7 +359,7 @@ export function useSerialConnection(): SerialLink {
 
   useEffect(() => {
     return () => {
-      void cleanup();
+      void cleanup(epochRef.current);
     };
   }, [cleanup]);
 

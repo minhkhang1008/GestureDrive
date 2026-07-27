@@ -32,7 +32,11 @@ export interface CommandOptions {
 }
 
 export function clampInteger(value: number, min: number, max: number): number {
-  if (!Number.isFinite(value)) return min;
+  // Non-finite input snaps to the value closest to zero, never to an extreme:
+  // NaN throttle must become neutral, not full reverse.
+  if (!Number.isFinite(value)) {
+    return Math.round(Math.min(max, Math.max(min, 0)));
+  }
   return Math.round(Math.min(max, Math.max(min, value)));
 }
 
@@ -48,8 +52,10 @@ export function createStopCommand(
   options: { estop?: boolean; resetEstop?: boolean } = {},
 ): ControlCommand {
   let flags = 0;
+  // ESTOP wins outright: the firmware rejects ESTOP+RESET_ESTOP together, and
+  // an emergency stop must never be weakened by a stray reset bit.
   if (options.estop) flags |= COMMAND_FLAG.ESTOP;
-  if (options.resetEstop) flags |= COMMAND_FLAG.RESET_ESTOP;
+  else if (options.resetEstop) flags |= COMMAND_FLAG.RESET_ESTOP;
   return {
     type: COMMAND_TYPE.STOP,
     channelA: 0,
@@ -95,13 +101,6 @@ export function createDirectPwmCommand(
 export const STOP_COMMAND = createStopCommand();
 export const ESTOP_COMMAND = createStopCommand({ estop: true });
 export const RESET_ESTOP_COMMAND = createStopCommand({ resetEstop: true });
-
-export function isStopCommand(command: ControlCommand): boolean {
-  return (
-    command.type === COMMAND_TYPE.STOP ||
-    (command.channelA === 0 && command.channelB === 0)
-  );
-}
 
 export function sameControlCommand(
   a: ControlCommand | null,

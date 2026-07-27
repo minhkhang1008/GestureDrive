@@ -1,5 +1,7 @@
 import { Gauge, HandPalm, LockSimple, WarningOctagon } from "@phosphor-icons/react";
 import {
+  FIRMWARE_K_TURN,
+  FIRMWARE_MAX_PWM,
   applyOutputLimit,
   mixDifferentialDrive,
   scaleDriveOutput,
@@ -17,16 +19,25 @@ function signed(value: number): string {
 }
 
 function outputPreview(command: ControlCommand): { left: number; right: number } {
+  // Mirror the full ESP2 chain: mix with the firmware turn gain, scale by the
+  // packet speed limit, then clamp with the bench MAX_PWM ceiling so the
+  // preview never promises output the vehicle will refuse to drive.
   if (command.type === COMMAND_TYPE.DRIVE) {
-    return scaleDriveOutput(
-      mixDifferentialDrive(command.channelA, command.channelB),
-      command.speedLimit,
+    return applyOutputLimit(
+      scaleDriveOutput(
+        mixDifferentialDrive(command.channelA, command.channelB, FIRMWARE_K_TURN),
+        command.speedLimit,
+      ),
+      FIRMWARE_MAX_PWM,
     );
   }
   if (command.type === COMMAND_TYPE.DIRECT_PWM) {
     return applyOutputLimit(
-      { left: command.channelA, right: command.channelB },
-      command.speedLimit,
+      applyOutputLimit(
+        { left: command.channelA, right: command.channelB },
+        command.speedLimit,
+      ),
+      FIRMWARE_MAX_PWM,
     );
   }
   return { left: 0, right: 0 };
@@ -63,7 +74,7 @@ export function CurrentCommand({
   const preview = outputPreview(current);
   const stop = current.type === COMMAND_TYPE.STOP;
   const estop = Boolean(current.flags & COMMAND_FLAG.ESTOP) || estopLatched;
-  const channelNames =
+  const channelNames: [string, string] =
     current.type === COMMAND_TYPE.DRIVE
       ? ["Throttle (A)", "Steering (B)"]
       : current.type === COMMAND_TYPE.DIRECT_PWM
@@ -109,9 +120,12 @@ export function CurrentCommand({
           <p className="mt-1 text-[11px] text-faint">
             Limit {current.speedLimit} / flags 0x{current.flags.toString(16).toUpperCase().padStart(2, "0")}
           </p>
-          <p className="mt-1 flex items-center gap-1.5 text-[11px] text-dim">
+          <p className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-dim">
             {current.flags & COMMAND_FLAG.SPEED_LOCKED ? <LockSimple size={12} /> : <Gauge size={12} />}
-            Output preview L {signed(preview.left)} / R {signed(preview.right)}
+            Output L {signed(preview.left)} / R {signed(preview.right)}
+            <span className="text-[10px] text-faint">
+              ước tính sau MAX_PWM {FIRMWARE_MAX_PWM}
+            </span>
           </p>
         </div>
       </div>
