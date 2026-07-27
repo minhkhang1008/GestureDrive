@@ -71,6 +71,9 @@ export default function App() {
   const [current, setCurrent] = useState<PresentedCommand>(INITIAL_COMMAND);
   const [previous, setPrevious] = useState<PresentedCommand | null>(null);
   const [manualSpeedLimit, setManualSpeedLimit] = useState(DEFAULT_SPEED_LIMIT);
+  // AUTO ceiling. The steering hand sets throttle proportionally; this only
+  // caps how much of it reaches the motors.
+  const [autoSpeedLimit, setAutoSpeedLimit] = useState(DEFAULT_SPEED_LIMIT);
   const [calibrationLimitPercent, setCalibrationLimitPercent] = useState(60);
   const [activeDirection, setActiveDirection] = useState<DirectionCode | null>(null);
   const [estopLatched, setEstopLatched] = useState(false);
@@ -340,7 +343,10 @@ export default function App() {
     [appendLog, cancelPulse, presentCommand, sendToBridge],
   );
 
-  const tracking = useHandTracking({ onControlUpdate });
+  const tracking = useHandTracking({
+    onControlUpdate,
+    speedLimit: autoSpeedLimit,
+  });
   const resetTrackingControl = tracking.resetControlState;
 
   const startManual = useCallback(
@@ -614,11 +620,18 @@ export default function App() {
                 pipelineLatencyMs={tracking.pipelineLatencyMs}
                 delegate={tracking.delegate}
                 mode={mode}
+                speedLimit={autoSpeedLimit}
                 onStart={() => void tracking.start()}
               />
               <div className="mt-4">
                 {mode === "AUTO" ? (
-                  <GestureLegend />
+                  <GestureLegend
+                    speedLimit={autoSpeedLimit}
+                    onSpeedLimitChange={(value) => {
+                      stopNow("STOP trước khi đổi speed limit");
+                      setAutoSpeedLimit(value);
+                    }}
+                  />
                 ) : (
                   <ManualPad
                     active={activeDirection}

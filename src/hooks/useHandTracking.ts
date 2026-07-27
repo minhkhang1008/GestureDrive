@@ -6,26 +6,18 @@ import {
   STOP_COMMAND,
   type ControlCommand,
 } from "../lib/controlTypes";
-import { clamp, ema, OneEuroFilter } from "../lib/filters";
+import { clamp, ema } from "../lib/filters";
 import {
   analogDriveFromVector,
+  classifyAnchorPlacement,
   DEADZONE_ENTER_SPAN,
   directionName,
-  fingersUp,
   FULL_DEFLECTION_SPAN,
   HAND_CONNECTIONS,
   handSpan,
   mirrorLandmarks,
-  ORIENTATION_GATE_THROTTLE,
-  recognizeSetupPose,
-  recognizeSpeedPose,
-  resolvePalmOrientation,
   stickySector,
-  type Handedness,
-  type PalmOrientation,
   type Point,
-  type ScreenSide,
-  type SpeedGestureState,
 } from "../lib/gestureRecognition";
 import {
   HandTracker,
@@ -34,7 +26,6 @@ import {
   predictCenter,
   type HandTrack,
 } from "../lib/handTracking";
-import { SpeedSlider } from "../lib/speedControl";
 import type {
   HandLandmarkerDelegate,
   HandLandmarkerWorkerRequest,
@@ -50,24 +41,20 @@ export type TrackingStatus =
   | "denied"
   | "error";
 
-export type SetupStatus = "waiting" | "calibrating" | "ready";
-
-export interface HandRoles {
-  control: ScreenSide;
-  speed: ScreenSide;
-}
+/**
+ * "waiting"  no usable hand, or the hand is somewhere the centre cannot be set.
+ * "arming"   a valid spot is being held still; the confirmation timer is running.
+ * "ready"    the centre is confirmed and the joystick is live.
+ */
+export type SetupStatus = "waiting" | "arming" | "ready";
 
 export interface LiveGesture {
-  /** Display sector; null while the palm orientation blocks the command. */
   code: DirectionCode | null;
   name: string;
   confidence: number;
-  speed: number;
-  speedLocked: boolean;
-  speedState: SpeedGestureState;
-  roles: HandRoles | null;
   setupStatus: SetupStatus;
-  orientationValid: boolean;
+  /** 0..1 progress of the hold-still confirmation, only while "arming". */
+  armProgress: number;
   handCount: number;
   controlAnchor: Point | null;
   /** Quantized analog channels actually being emitted (-1000..1000). */
@@ -85,23 +72,8 @@ export interface LiveGesture {
 
 interface Options {
   onControlUpdate: (command: ControlCommand, label: string) => void;
-}
-
-/**
- * A driving role bound to a tracked hand. The id is the primary key, so the
- * role follows the physical hand across the screen midline. Handedness and the
- * last known side are the fallback used to re-bind the role when the tracker
- * has to drop and re-create the track.
- */
-interface RoleBinding {
-  id: number;
-  handedness: Handedness;
-  side: ScreenSide;
-}
-
-interface RoleBindings {
-  control: RoleBinding;
-  speed: RoleBinding;
+  /** Safety ceiling sent with every DRIVE packet, 0..1000. Owned by the UI. */
+  speedLimit: number;
 }
 
 interface HudState {
@@ -109,7 +81,9 @@ interface HudState {
   palm: Point;
   scale: number;
   active: boolean;
-  orientationValid: boolean;
+  /** While arming, the ring at the palm fills as the hold completes. */
+  arming: boolean;
+  armProgress: number;
 }
 
 const ACCENT = "#3b82f6";
@@ -117,14 +91,23 @@ const JOINT = "#dbeafe";
 const STOPPED = "#ef4444";
 const MARGINAL = "#f59e0b";
 
-const SETUP_STABLE_FRAMES = 6;
-const ROLE_RESET_MS = 800;
 /**
- * How long a role may stay bound while its hand is unavailable. The vehicle is
- * stopped for the whole window; this only decides how long the operator has to
- * bring the hand back before the open/fist setup has to be repeated.
+ * How long the anchor survives with no usable hand. The vehicle is stopped for
+ * the whole window; this only decides whether the hand coming back resumes
+ * against the old anchor or has to confirm a new centre.
  */
-const ROLE_REBIND_GRACE_MS = 800;
+const ANCHOR_GRACE_MS = 800;
+
+// --- Centre confirmation ---------------------------------------------------
+// The joystick origin is deliberately NOT planted the instant a hand appears:
+// a hand entering from the side would set the origin against the frame edge,
+// leaving no room to drag that way. The operator holds still instead, which
+// picks the spot on purpose and costs no extra inference.
+
+/** Hold this long inside the still radius to confirm the centre. */
+const ARM_HOLD_MS = 600;
+/** Allowed drift during the hold, in palm spans, before the timer restarts. */
+const ARM_STILL_RADIUS_SPAN = 0.3;
 const CAMERA_FRAME_TIMEOUT_MS = 250;
 const WORKER_START_TIMEOUT_MS = 20_000;
 /** Watchdog: silence from the AI worker longer than this forces STOP. */
@@ -140,14 +123,10 @@ const CONFIDENCE_WINDOW = 15;
 
 const EMPTY_LIVE: LiveGesture = {
   code: null,
-  name: "Đặt hai tay ở hai bên khung hình",
+  name: "Đưa một bàn tay vào khung hình",
   confidence: 0,
-  speed: 0,
-  speedLocked: true,
-  speedState: "absent",
-  roles: null,
   setupStatus: "waiting",
-  orientationValid: true,
+  armProgress: 0,
   handCount: 0,
   controlAnchor: null,
   throttle: 0,
@@ -166,22 +145,13 @@ function quantizeChannel(value: number): number {
   return clamp(Math.round(value / CHANNEL_STEP) * CHANNEL_STEP, -1000, 1000);
 }
 
-function sameRoles(a: HandRoles | null, b: HandRoles | null): boolean {
-  if (a === null || b === null) return a === b;
-  return a.control === b.control && a.speed === b.speed;
-}
-
 function sameLive(a: LiveGesture, b: LiveGesture): boolean {
   return (
     a.code === b.code &&
     a.name === b.name &&
     a.confidence === b.confidence &&
-    a.speed === b.speed &&
-    a.speedLocked === b.speedLocked &&
-    a.speedState === b.speedState &&
-    sameRoles(a.roles, b.roles) &&
     a.setupStatus === b.setupStatus &&
-    a.orientationValid === b.orientationValid &&
+    a.armProgress === b.armProgress &&
     a.handCount === b.handCount &&
     a.throttle === b.throttle &&
     a.steering === b.steering &&
@@ -202,7 +172,7 @@ function quantizeQuality(value: number): number {
   return Math.round(value * 20) / 20;
 }
 
-export function useHandTracking({ onControlUpdate }: Options) {
+export function useHandTracking({ onControlUpdate, speedLimit }: Options) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -229,24 +199,21 @@ export function useHandTracking({ onControlUpdate }: Options) {
   const detectErrorsRef = useRef(0);
   const workerRecycledRef = useRef(false);
   const onControlRef = useRef(onControlUpdate);
+  const speedLimitRef = useRef(speedLimit);
 
   const trackerRef = useRef<HandTracker>(new HandTracker(16 / 9));
-  const roleBindingsRef = useRef<RoleBindings | null>(null);
-  const roleMissingSinceRef = useRef<number | null>(null);
+  /** Joystick origin in planar space; null until a trusted hand sets it. */
   const controlAnchorRef = useRef<Point | null>(null);
-  const setupHistoryRef = useRef<string[]>([]);
-  // Per-track gesture memory (finger and palm-orientation hysteresis), keyed by
-  // the tracker's stable id so it follows the hand instead of the screen half.
-  const fingerStateRef = useRef(new Map<number, boolean[]>());
-  const orientationStateRef = useRef(new Map<number, PalmOrientation>());
+  /** Tracker id the anchor belongs to, so a different hand must re-confirm. */
+  const anchorTrackIdRef = useRef<number | null>(null);
+  /** Where the current hold-still attempt started, in planar space. */
+  const armCandidateRef = useRef<Point | null>(null);
+  const armStartedAtRef = useRef(0);
   const driveActiveRef = useRef(false);
   const sectorRef = useRef<DirectionCode>("S");
   const confidenceWindowRef = useRef<DirectionCode[]>([]);
-  const pinchFilterRef = useRef(new OneEuroFilter({ minCutoffHz: 1.2, beta: 0.02 }));
-  const speedSliderRef = useRef(new SpeedSlider());
-  const speedLockedRef = useRef(true);
   const emittedRef = useRef<ControlCommand | null>(null);
-  const bothMissingSinceRef = useRef<number | null>(null);
+  const handMissingSinceRef = useRef<number | null>(null);
   const lastVideoTimeRef = useRef(-1);
   const lastFreshFrameMsRef = useRef(0);
   const lastResultAtRef = useRef(0);
@@ -266,6 +233,10 @@ export function useHandTracking({ onControlUpdate }: Options) {
     onControlRef.current = onControlUpdate;
   }, [onControlUpdate]);
 
+  useEffect(() => {
+    speedLimitRef.current = speedLimit;
+  }, [speedLimit]);
+
   const emit = useCallback((command: ControlCommand, label: string) => {
     if (sameControlCommand(emittedRef.current, command)) return;
     emittedRef.current = command;
@@ -280,20 +251,15 @@ export function useHandTracking({ onControlUpdate }: Options) {
 
   const resetRoles = useCallback(
     (emitStop: boolean) => {
-      roleBindingsRef.current = null;
-      roleMissingSinceRef.current = null;
       controlAnchorRef.current = null;
-      setupHistoryRef.current = [];
+      anchorTrackIdRef.current = null;
+      armCandidateRef.current = null;
+      armStartedAtRef.current = 0;
       trackerRef.current.reset();
-      fingerStateRef.current.clear();
-      orientationStateRef.current.clear();
       driveActiveRef.current = false;
       sectorRef.current = "S";
       confidenceWindowRef.current = [];
-      pinchFilterRef.current.reset();
-      speedSliderRef.current.reset();
-      speedLockedRef.current = true;
-      bothMissingSinceRef.current = null;
+      handMissingSinceRef.current = null;
       emittedRef.current = null;
       hudRef.current = null;
       overlayQualityRef.current = 1;
@@ -372,11 +338,39 @@ export function useHandTracking({ onControlUpdate }: Options) {
     const palmX = (hud.palm.x / aspect) * width;
     const palmY = hud.palm.y * height;
     const spanPx = hud.scale * height;
-    const color = !hud.orientationValid
-      ? STOPPED
-      : hud.active
-        ? ACCENT
-        : "rgba(255,255,255,0.75)";
+    const color = hud.active ? ACCENT : "rgba(255,255,255,0.75)";
+
+    // While arming, the joystick does not exist yet. Draw only the hold-still
+    // ring at the palm: a faint full circle plus an arc that sweeps as the
+    // hold completes, so the operator sees exactly where the centre will land.
+    if (hud.arming) {
+      const radius = DEADZONE_ENTER_SPAN * spanPx;
+      ctx.lineWidth = 4;
+      ctx.lineCap = "round";
+      ctx.strokeStyle = "rgba(255,255,255,0.25)";
+      ctx.beginPath();
+      ctx.arc(palmX, palmY, radius, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.strokeStyle = ACCENT;
+      ctx.beginPath();
+      ctx.arc(
+        palmX,
+        palmY,
+        radius,
+        -Math.PI / 2,
+        -Math.PI / 2 + Math.PI * 2 * hud.armProgress,
+      );
+      ctx.stroke();
+
+      ctx.fillStyle = ACCENT;
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      ctx.arc(palmX, palmY, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      return;
+    }
 
     // Dead zone ring (enter radius) and full-deflection ring.
     ctx.lineWidth = 2;
@@ -420,269 +414,131 @@ export function useHandTracking({ onControlUpdate }: Options) {
         observeHand(hand.landmarks, hand.handedness, hand.handednessScore, aspect),
       );
       const tracks = trackerRef.current.update(observations, now);
-      const byId = new Map(tracks.map((track) => [track.id, track] as const));
 
-      // Per-track gesture memory lives exactly as long as its track.
-      for (const id of [...fingerStateRef.current.keys()]) {
-        if (!byId.has(id)) fingerStateRef.current.delete(id);
-      }
-      for (const id of [...orientationStateRef.current.keys()]) {
-        if (!byId.has(id)) orientationStateRef.current.delete(id);
-      }
+      setHandPresent(tracks.length > 0);
 
-      const hasHands = tracks.length > 0;
-      setHandPresent(hasHands);
-
-      if (!hasHands) {
-        if (bothMissingSinceRef.current === null) {
-          bothMissingSinceRef.current = now;
-        }
-        if (
-          roleBindingsRef.current &&
-          now - bothMissingSinceRef.current >= ROLE_RESET_MS
-        ) {
-          resetRoles(true);
-          return;
-        }
-      } else {
-        bothMissingSinceRef.current = null;
-      }
-
-      const readFingers = (track: HandTrack): boolean[] => {
-        const fingers = fingersUp(
-          track.landmarks,
-          fingerStateRef.current.get(track.id) ?? null,
-        );
-        fingerStateRef.current.set(track.id, fingers);
-        return fingers;
-      };
-
-      // --- Role setup: one open hand and one fist, on opposite halves -------
-      if (!roleBindingsRef.current) {
-        // No role hand is bound yet, so there is no drive verdict to tint by.
-        overlayQualityRef.current = 1;
-        setDriveReady(false);
-        let name = "Đặt hai tay ở hai bên khung hình";
-        let setupStatus: SetupStatus = "waiting";
-
-        const usable = tracks.filter(
-          (track) => !track.coasting && track.quality >= MIN_DRIVE_QUALITY,
-        );
-        const leftHands = usable.filter((track) => track.side === "left");
-        const rightHands = usable.filter((track) => track.side === "right");
-        const leftHand = leftHands.length === 1 ? leftHands[0] : undefined;
-        const rightHand = rightHands.length === 1 ? rightHands[0] : undefined;
-
-        if (leftHand && rightHand && usable.length === 2) {
-          const leftPose = recognizeSetupPose(readFingers(leftHand));
-          const rightPose = recognizeSetupPose(readFingers(rightHand));
-          const validPair =
-            (leftPose === "open" && rightPose === "fist") ||
-            (leftPose === "fist" && rightPose === "open");
-
-          if (validPair) {
-            const controlHand = leftPose === "open" ? leftHand : rightHand;
-            const speedHand = controlHand === leftHand ? rightHand : leftHand;
-            const key = `${controlHand.id}:${speedHand.id}`;
-            const history = setupHistoryRef.current;
-            history.push(key);
-            if (history.length > SETUP_STABLE_FRAMES) history.shift();
-            const stable =
-              history.length === SETUP_STABLE_FRAMES &&
-              history.every((item) => item === key);
-
-            setupStatus = "calibrating";
-            name = "Giữ nguyên để xác nhận vai trò hai tay";
-            if (stable) {
-              const nextRoles: HandRoles = {
-                control: controlHand.side,
-                speed: speedHand.side,
-              };
-              roleBindingsRef.current = {
-                control: {
-                  id: controlHand.id,
-                  handedness: controlHand.handedness,
-                  side: controlHand.side,
-                },
-                speed: {
-                  id: speedHand.id,
-                  handedness: speedHand.handedness,
-                  side: speedHand.side,
-                },
-              };
-              roleMissingSinceRef.current = null;
-              controlAnchorRef.current = { ...controlHand.smoothedCenter };
-              driveActiveRef.current = false;
-              sectorRef.current = "S";
-              confidenceWindowRef.current = [];
-              pinchFilterRef.current.reset();
-              speedSliderRef.current.reset();
-              speedLockedRef.current = true;
-              setDriveReady(true);
-              emit(STOP_COMMAND, "Gesture STOP");
-              publishLive({
-                ...EMPTY_LIVE,
-                code: "S",
-                name: "Đã xác nhận. Chụm ngón cái-trỏ để kéo tốc độ",
-                roles: nextRoles,
-                setupStatus: "ready",
-                handCount: tracks.length,
-                controlAnchor: {
-                  x: controlHand.smoothedCenter.x / aspect,
-                  y: controlHand.smoothedCenter.y,
-                },
-                speedState: "locked",
-                quality: quantizeQuality(
-                  Math.min(controlHand.quality, speedHand.quality),
-                ),
-              });
-              return;
-            }
-          } else {
-            setupHistoryRef.current = [];
-            name = "Xòe tay điều hướng, nắm tay tốc độ";
-          }
-        } else {
-          setupHistoryRef.current = [];
-          if (tracks.length >= 2) {
-            name = "Giữ hai tay rõ nét ở hai nửa khung hình";
-          }
-        }
-
-        publishLive({
-          ...EMPTY_LIVE,
-          name,
-          setupStatus,
-          handCount: tracks.length,
-          quality: quantizeQuality(
-            usable.length === 0
-              ? 0
-              : Math.min(...usable.map((track) => track.quality)),
-          ),
-        });
-        return;
-      }
-
-      // --- Resolve the two role hands --------------------------------------
-      const bindings = roleBindingsRef.current;
-      let controlHand = byId.get(bindings.control.id);
-      let speedHand = byId.get(bindings.speed.id);
-
-      // A dropped track does not have to cost the operator the whole setup:
-      // an unclaimed, trusted hand of the same handedness on the same side is
-      // accepted as the same physical hand coming back.
-      const rebind = (binding: RoleBinding, takenId: number | undefined) => {
-        const candidate = tracks.find(
-          (track) =>
-            track.id !== takenId &&
-            !track.coasting &&
-            track.quality >= MIN_DRIVE_QUALITY &&
-            track.handedness === binding.handedness &&
-            track.side === binding.side,
-        );
-        if (candidate) binding.id = candidate.id;
-        return candidate;
-      };
-      if (!controlHand) {
-        controlHand = rebind(bindings.control, speedHand?.id);
-        if (controlHand) {
-          // The hand came back somewhere else in the frame. Keeping the old
-          // anchor would read that offset as a large deflection and launch the
-          // vehicle, so the joystick re-centers on where the hand actually is.
-          controlAnchorRef.current = { ...controlHand.smoothedCenter };
-          driveActiveRef.current = false;
-          sectorRef.current = "S";
-        }
-      }
-      if (!speedHand) {
-        speedHand = rebind(bindings.speed, controlHand?.id);
-        if (speedHand) {
-          // A pinch that was in progress when the hand vanished must not resume
-          // against a stale grab point; SpeedSlider.hold() already released the
-          // grab, this clears the filter that fed it.
-          pinchFilterRef.current.reset();
-        }
-      }
-
-      const roles: HandRoles = {
-        control: controlHand?.side ?? bindings.control.side,
-        speed: speedHand?.side ?? bindings.speed.side,
-      };
-      const anchor = controlAnchorRef.current;
-
-      // The control hand is the dead-man. The speed hand only sets a ceiling,
-      // so once that ceiling is chosen it may leave the frame: the value is
-      // held and driving continues one-handed.
+      // The single best-quality track is the control hand. numHands is 1, so
+      // this is normally the only track; the reduce still matters for the one
+      // frame where a dropped track and its replacement briefly coexist.
+      const controlHand = tracks.reduce<HandTrack | undefined>(
+        (best, track) =>
+          !best || track.quality > best.quality ? track : best,
+        undefined,
+      );
       const controlTrusted =
-        controlHand !== undefined && controlHand.quality >= MIN_DRIVE_QUALITY;
-      const speedTrusted =
-        speedHand !== undefined && speedHand.quality >= MIN_DRIVE_QUALITY;
-      const canDrive = controlTrusted && anchor !== null;
-      setDriveReady(canDrive);
+        controlHand !== undefined &&
+        !controlHand.coasting &&
+        controlHand.quality >= MIN_DRIVE_QUALITY;
 
-      if (controlHand) {
-        // Remember where the hand currently is, so a later re-bind looks for it
-        // on the side it was actually last seen on.
-        bindings.control.side = controlHand.side;
-        roleMissingSinceRef.current = null;
-      } else if (roleMissingSinceRef.current === null) {
-        roleMissingSinceRef.current = now;
-      } else if (now - roleMissingSinceRef.current >= ROLE_REBIND_GRACE_MS) {
-        // The control hand never came back: fall back to open/fist setup. A
-        // missing speed hand never triggers this — it is allowed to stay away.
-        resetRoles(true);
-        return;
+      // --- Anchor lifecycle -------------------------------------------------
+      // The anchor is the joystick origin. It is never planted automatically:
+      // the operator holds the hand still, away from the frame edges, and the
+      // spot is confirmed only when the hold completes. A short dropout keeps
+      // a confirmed anchor, but a different hand always has to confirm again.
+      let armProgress = 0;
+      /** Set while a hand is present but the centre cannot be confirmed yet. */
+      let blockedReason: string | null = null;
+
+      if (controlTrusted) {
+        handMissingSinceRef.current = null;
+      } else if (controlAnchorRef.current !== null) {
+        if (handMissingSinceRef.current === null) {
+          handMissingSinceRef.current = now;
+        } else if (now - handMissingSinceRef.current >= ANCHOR_GRACE_MS) {
+          controlAnchorRef.current = null;
+          anchorTrackIdRef.current = null;
+        }
       }
-      if (speedHand) bindings.speed.side = speedHand.side;
 
-      // --- Speed hand: pinch = grab slider, drag vertically, release = lock -
-      // Runs before the drive gate so the ceiling can still be adjusted while
-      // the control hand is down.
-      const slider = speedSliderRef.current;
-      let speedResult;
-      if (speedHand && speedTrusted) {
-        const speedPose = recognizeSpeedPose(
-          speedHand.landmarks,
-          fingerStateRef.current.get(speedHand.id) ?? null,
-          slider.isPinching(),
+      const anchorValid =
+        controlAnchorRef.current !== null &&
+        (!controlTrusted || anchorTrackIdRef.current === controlHand.id);
+
+      if (controlTrusted && !anchorValid) {
+        // No usable centre yet: run the hold-still confirmation.
+        const palm = controlHand.smoothedCenter;
+        const placement = classifyAnchorPlacement(
+          palm,
+          controlHand.scale,
           aspect,
         );
-        fingerStateRef.current.set(speedHand.id, speedPose.fingers);
-        speedResult = slider.apply(
-          speedPose.state,
-          pinchFilterRef.current.filter(speedPose.pinchY, now),
-          speedHand.scale,
-        );
-      } else {
-        pinchFilterRef.current.reset();
-        speedResult = slider.hold();
-      }
-      speedLockedRef.current = speedResult.locked;
 
-      // Only the control hand can stop the vehicle now, so only its
-      // re-acquisition raises the banner.
+        if (placement !== "ok") {
+          armCandidateRef.current = null;
+          blockedReason =
+            placement === "near-edge"
+              ? "Đưa tay vào giữa khung hình để đặt tâm"
+              : "Lùi ra xa camera một chút để đặt tâm";
+        } else {
+          const candidate = armCandidateRef.current;
+          const drift = candidate
+            ? Math.hypot(palm.x - candidate.x, palm.y - candidate.y) /
+              Math.max(controlHand.scale, 0.001)
+            : Infinity;
+          if (!candidate || drift > ARM_STILL_RADIUS_SPAN) {
+            // Moved too far: restart the hold from where the hand is now.
+            armCandidateRef.current = { ...palm };
+            armStartedAtRef.current = now;
+          }
+          armProgress = clamp(
+            (now - armStartedAtRef.current) / ARM_HOLD_MS,
+            0,
+            1,
+          );
+          if (armProgress >= 1) {
+            controlAnchorRef.current = { ...palm };
+            anchorTrackIdRef.current = controlHand.id;
+            armCandidateRef.current = null;
+            driveActiveRef.current = false;
+            sectorRef.current = "S";
+          } else {
+            blockedReason = "Giữ yên tay để xác nhận tâm";
+          }
+        }
+      } else if (!controlTrusted) {
+        armCandidateRef.current = null;
+      }
+
+      const anchor = controlAnchorRef.current;
       const quality = controlHand?.quality ?? 0;
       const reacquiring = Boolean(controlHand?.reacquiring);
-      overlayQualityRef.current = quality;
+      overlayQualityRef.current = controlTrusted ? quality : 0;
+
+      const canDrive = controlTrusted && anchor !== null;
+      setDriveReady(canDrive);
 
       if (!canDrive || !controlHand || !anchor) {
         driveActiveRef.current = false;
         sectorRef.current = "S";
-        hudRef.current = null;
+        // Keep the HUD alive while arming so the operator can see the ring
+        // filling at the spot they are about to claim as the centre.
+        hudRef.current =
+          controlTrusted && controlHand && blockedReason !== null
+            ? {
+                anchor: { ...controlHand.smoothedCenter },
+                palm: controlHand.smoothedCenter,
+                scale: controlHand.scale,
+                active: false,
+                // Always the hold-still ring while the centre is unconfirmed:
+                // drawing the dead-zone and full-deflection rings here would
+                // show a joystick that does not exist yet.
+                arming: true,
+                armProgress,
+              }
+            : null;
         emit(STOP_COMMAND, "Gesture STOP");
         publishLive({
           ...EMPTY_LIVE,
           code: "S",
           name: reacquiring
             ? "Đang bắt lại bàn tay — xe đã dừng"
-            : controlHand
-              ? "Tín hiệu tay điều hướng chưa đủ tin cậy — xe đã dừng"
-              : "Cần thấy tay điều hướng để tiếp tục",
-          speed: speedResult.value,
-          speedLocked: speedResult.locked,
-          speedState: speedResult.gesture,
-          roles,
-          setupStatus: "ready",
+            : blockedReason
+              ? blockedReason
+              : controlHand
+                ? "Tín hiệu tay chưa đủ tin cậy — xe đã dừng"
+                : "Đưa một bàn tay vào khung hình",
+          setupStatus: armProgress > 0 ? "arming" : "waiting",
+          armProgress: Math.round(armProgress * 20) / 20,
           handCount: tracks.length,
           controlAnchor: anchor ? { x: anchor.x / aspect, y: anchor.y } : null,
           quality: quantizeQuality(quality),
@@ -701,21 +557,6 @@ export function useHandTracking({ onControlUpdate }: Options) {
       const dySpan = (filteredPalm.y - anchor.y) / scaleEma;
       const analog = analogDriveFromVector(dxSpan, dySpan, driveActiveRef.current);
 
-      const orientation = resolvePalmOrientation(
-        controlHand.landmarks,
-        controlHand.handedness,
-        orientationStateRef.current.get(controlHand.id) ?? null,
-        aspect,
-      );
-      orientationStateRef.current.set(controlHand.id, orientation);
-
-      const wantsForward = analog.throttle > ORIENTATION_GATE_THROTTLE;
-      const wantsReverse = analog.throttle < -ORIENTATION_GATE_THROTTLE;
-      const orientationValid =
-        !analog.active ||
-        (!(wantsForward && orientation === "back") &&
-          !(wantsReverse && orientation === "palm"));
-
       // Slowly re-center the anchor while resting in the dead zone so slow
       // posture drift never turns into a phantom command.
       if (!analog.active) {
@@ -723,9 +564,9 @@ export function useHandTracking({ onControlUpdate }: Options) {
         anchor.y = ema(anchor.y, filteredPalm.y, ANCHOR_RECENTER_ALPHA);
       }
 
-      driveActiveRef.current = analog.active && orientationValid;
+      driveActiveRef.current = analog.active;
 
-      const sector: DirectionCode = driveActiveRef.current
+      const sector: DirectionCode = analog.active
         ? stickySector(dxSpan, dySpan, sectorRef.current)
         : "S";
       sectorRef.current = sector;
@@ -740,56 +581,44 @@ export function useHandTracking({ onControlUpdate }: Options) {
         anchor: { x: anchor.x, y: anchor.y },
         palm: filteredPalm,
         scale: scaleEma,
-        active: driveActiveRef.current,
-        orientationValid,
+        active: analog.active,
+        arming: false,
+        armProgress: 0,
       };
 
       // --- Emit ------------------------------------------------------------
       const throttle = quantizeChannel(analog.throttle);
       const steering = quantizeChannel(analog.steering);
       let name: string;
-      let command: ControlCommand;
 
-      if (!orientationValid) {
-        command = STOP_COMMAND;
-        name =
-          analog.throttle > 0
-            ? "Hướng lòng bàn tay vào camera để tiến"
-            : "Hướng mu bàn tay vào camera để lùi";
-        emit(command, "Gesture STOP");
-      } else if (!driveActiveRef.current) {
-        command = STOP_COMMAND;
+      if (!analog.active) {
         name = directionName("S");
-        emit(command, "Gesture STOP");
+        emit(STOP_COMMAND, "Gesture STOP");
       } else {
-        command = createDriveCommand(throttle, steering, speedResult.value, {
-          speedLocked: speedResult.locked,
-        });
         name = directionName(sector);
-        emit(command, `Gesture ${sector}`);
+        emit(
+          createDriveCommand(throttle, steering, speedLimitRef.current),
+          `Gesture ${sector}`,
+        );
       }
 
       publishLive({
-        code: orientationValid ? sector : null,
+        code: sector,
         name,
         confidence: Math.round(confidence * 100) / 100,
-        speed: speedResult.value,
-        speedLocked: speedResult.locked,
-        speedState: speedResult.gesture,
-        roles,
         setupStatus: "ready",
-        orientationValid,
+        armProgress: 0,
         handCount: tracks.length,
         controlAnchor: { x: anchor.x / aspect, y: anchor.y },
-        throttle: driveActiveRef.current ? throttle : 0,
-        steering: driveActiveRef.current ? steering : 0,
+        throttle: analog.active ? throttle : 0,
+        steering: analog.active ? steering : 0,
         deflection: Math.round(analog.deflection * 100) / 100,
         stalled: false,
         quality: quantizeQuality(quality),
         reacquiring,
       });
     },
-    [emit, publishLive, resetRoles],
+    [emit, publishLive],
   );
 
   // -------------------------------------------------------------------------

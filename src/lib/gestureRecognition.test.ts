@@ -2,19 +2,12 @@ import { describe, expect, it } from "vitest";
 import { type DirectionCode } from "./commands";
 import {
   analogDriveFromVector,
+  ANCHOR_EDGE_MARGIN_SPAN,
+  classifyAnchorPlacement,
   DEADZONE_ENTER_SPAN,
   DEADZONE_EXIT_SPAN,
-  fingersUp,
   mirrorLandmarks,
-  normalizedPinchDistance,
-  ORIENTATION_HYSTERESIS_SPAN,
-  palmFacingSigned,
   palmScalePlanar,
-  PINCH_ENTER_RATIO,
-  PINCH_EXIT_RATIO,
-  recognizeSetupPose,
-  recognizeSpeedPose,
-  resolvePalmOrientation,
   sectorFromVector,
   stickySector,
   type Landmark,
@@ -23,80 +16,6 @@ import {
 function point(x = 0.5, y = 0.5, z = 0): Landmark {
   return { x, y, z };
 }
-
-function speedHand(pinchRatio: number): Landmark[] {
-  const landmarks = Array.from({ length: 21 }, () => point());
-
-  landmarks[0] = point(0.5, 0.9); // wrist
-  landmarks[5] = point(0.35, 0.65); // index MCP
-  landmarks[9] = point(0.5, 0.65); // middle MCP
-  landmarks[13] = point(0.6, 0.67); // ring MCP
-  landmarks[17] = point(0.65, 0.7); // pinky MCP
-
-  // Keep the three supporting fingers extended, matching the OK/pinch pose.
-  for (const [mcp, pip, dip, tip] of [
-    [9, 10, 11, 12],
-    [13, 14, 15, 16],
-    [17, 18, 19, 20],
-  ] as const) {
-    const x = landmarks[mcp]?.x ?? 0.5;
-    landmarks[pip] = point(x, 0.5);
-    landmarks[dip] = point(x, 0.35);
-    landmarks[tip] = point(x, 0.2);
-  }
-
-  landmarks[8] = point(0.5, 0.3); // index tip
-  const palmScale = Math.hypot(0.65 - 0.35, 0.7 - 0.65);
-  landmarks[4] = point(0.5 - pinchRatio * palmScale, 0.3); // thumb tip
-  landmarks[2] = point(0.3, 0.68);
-  landmarks[3] = point(0.34, 0.48);
-
-  return landmarks;
-}
-
-describe("speed pinch pose", () => {
-  it("normalizes pinch distance against the palm instead of image pixels", () => {
-    const landmarks = speedHand(0.25);
-    expect(normalizedPinchDistance(landmarks, 1)).toBeCloseTo(0.25, 5);
-  });
-
-  it("uses separate pinch enter and exit thresholds to prevent flicker", () => {
-    const betweenThresholds = (PINCH_ENTER_RATIO + PINCH_EXIT_RATIO) / 2;
-    const landmarks = speedHand(betweenThresholds);
-
-    expect(recognizeSpeedPose(landmarks, null, false, 1).state).toBe("locked");
-    expect(recognizeSpeedPose(landmarks, null, true, 1).state).toBe("adjusting");
-  });
-
-  it("reports the pinch midpoint for the relative drag in the hook", () => {
-    const pose = recognizeSpeedPose(speedHand(0.2), null, false, 1);
-    expect(pose.state).toBe("adjusting");
-    expect(pose.pinchY).toBeCloseTo(0.3, 5);
-  });
-
-  it("declares the pose invalid when the supporting fingers curl", () => {
-    const landmarks = speedHand(0.2);
-    // Curl ring and pinky onto the palm.
-    for (const [pip, dip, tip] of [
-      [14, 15, 16],
-      [18, 19, 20],
-    ] as const) {
-      landmarks[pip] = point(0.6, 0.75);
-      landmarks[dip] = point(0.6, 0.85);
-      landmarks[tip] = point(0.6, 0.9);
-    }
-    expect(recognizeSpeedPose(landmarks, null, false, 1).state).toBe("invalid");
-  });
-});
-
-describe("finger hysteresis", () => {
-  it("keeps a previously extended finger extended in the hysteresis band", () => {
-    const landmarks = speedHand(0.2);
-    const fresh = fingersUp(landmarks, null);
-    const held = fingersUp(landmarks, fresh);
-    expect(held).toEqual(fresh);
-  });
-});
 
 describe("analog drive", () => {
   it("stays inactive inside the dead zone", () => {
@@ -160,95 +79,10 @@ describe("sector labeling", () => {
   });
 });
 
-describe("palm orientation", () => {
-  function orientedHand(indexX: number, pinkyX: number): Landmark[] {
-    const landmarks = Array.from({ length: 21 }, () => point());
-    landmarks[0] = point(0.5, 0.9);
-    landmarks[5] = point(indexX, 0.65);
-    landmarks[9] = point((indexX + pinkyX) / 2, 0.64);
-    landmarks[17] = point(pinkyX, 0.66);
-    return landmarks;
-  }
-
-  it("detects palm vs back in mirrored space for a right hand", () => {
-    // Mirrored space: right hand palm-forward has index right of pinky.
-    expect(resolvePalmOrientation(orientedHand(0.6, 0.4), "Right", null, 1)).toBe("palm");
-    expect(resolvePalmOrientation(orientedHand(0.4, 0.6), "Right", null, 1)).toBe("back");
-  });
-
-  it("mirrors the convention for a left hand", () => {
-    expect(resolvePalmOrientation(orientedHand(0.4, 0.6), "Left", null, 1)).toBe("palm");
-    expect(resolvePalmOrientation(orientedHand(0.6, 0.4), "Left", null, 1)).toBe("back");
-  });
-
-  it("applies hysteresis before flipping", () => {
-    // Barely flipped geometry: previous state must win.
-    const barelyBack = orientedHand(0.495, 0.505);
-    expect(resolvePalmOrientation(barelyBack, "Right", "palm", 1)).toBe("palm");
-    expect(resolvePalmOrientation(barelyBack, "Right", "back", 1)).toBe("back");
-  });
-
-  /** Rotate every landmark about the frame center, in isotropic planar space. */
-  function rotated(landmarks: Landmark[], degrees: number, aspect: number): Landmark[] {
-    const radians = (degrees * Math.PI) / 180;
-    const cos = Math.cos(radians);
-    const sin = Math.sin(radians);
-    return landmarks.map(({ x, y, z }) => {
-      const px = (x - 0.5) * aspect;
-      const py = y - 0.5;
-      return {
-        x: (px * cos - py * sin) / aspect + 0.5,
-        y: px * sin + py * cos + 0.5,
-        z,
-      };
-    });
-  }
-
-  it("survives in-plane rotation: the palm normal, not an x offset", () => {
-    const aspect = 16 / 9;
-    const palmForward = orientedHand(0.6, 0.4);
-    expect(resolvePalmOrientation(palmForward, "Right", null, aspect)).toBe("palm");
-    // Fingers pointing sideways and upside down still read as palm-forward.
-    for (const degrees of [45, 90, 135, 180, 225, 270, 315]) {
-      const turned = rotated(palmForward, degrees, aspect);
-      expect(resolvePalmOrientation(turned, "Right", null, aspect)).toBe("palm");
-      expect(palmFacingSigned(turned, "Right", aspect)).toBeCloseTo(
-        palmFacingSigned(palmForward, "Right", aspect),
-        6,
-      );
-    }
-  });
-
-  it("keeps the facing magnitude near zero for an edge-on hand", () => {
-    // Index and pinky MCP nearly coincident: the palm is seen edge-on and the
-    // signed facing collapses toward zero, which is what the hysteresis band
-    // around +/-ORIENTATION_HYSTERESIS_SPAN is there to absorb.
-    const edgeOn = orientedHand(0.5, 0.5);
-    expect(Math.abs(palmFacingSigned(edgeOn, "Right", 1))).toBeLessThan(
-      ORIENTATION_HYSTERESIS_SPAN,
-    );
-  });
-});
-
 describe("mirroring", () => {
   it("flips x and preserves y/z", () => {
     const [mirrored] = mirrorLandmarks([point(0.2, 0.3, 0.1)]);
     expect(mirrored).toEqual({ x: 0.8, y: 0.3, z: 0.1 });
-  });
-});
-
-describe("setup pose from finger states", () => {
-  it("requires all four long fingers for open, none for fist (thumb ignored)", () => {
-    expect(recognizeSetupPose([true, true, true, true, true])).toBe("open");
-    expect(recognizeSetupPose([false, true, true, true, true])).toBe("open");
-    expect(recognizeSetupPose([false, false, false, false, false])).toBe("fist");
-    expect(recognizeSetupPose([true, false, false, false, false])).toBe("fist");
-  });
-
-  it("classifies partial extension as other", () => {
-    expect(recognizeSetupPose([false, true, false, false, false])).toBe("other");
-    expect(recognizeSetupPose([false, true, true, true, false])).toBe("other");
-    expect(recognizeSetupPose([true, false, true, false, true])).toBe("other");
   });
 });
 
@@ -354,5 +188,59 @@ describe("sticky sector map", () => {
     expect(stickySector(Math.cos(justInside), Math.sin(justInside), null)).toBe("FR");
     const justPast = ((-90 + 31.5) * Math.PI) / 180;
     expect(stickySector(Math.cos(justPast), Math.sin(justPast), "F")).toBe("FR");
+  });
+});
+
+describe("joystick centre placement", () => {
+  const ASPECT = 16 / 9;
+  const SCALE = 0.2;
+  const MARGIN = ANCHOR_EDGE_MARGIN_SPAN * SCALE; // 0.16
+
+  it("accepts a hand near the middle of the frame", () => {
+    expect(
+      classifyAnchorPlacement({ x: ASPECT / 2, y: 0.5 }, SCALE, ASPECT),
+    ).toBe("ok");
+  });
+
+  it("rejects a centre with no room to drag toward the nearest edge", () => {
+    // A hand entering from the left: the origin would sit against the edge and
+    // leaving no leftward travel at all is exactly the bug this guards.
+    expect(classifyAnchorPlacement({ x: 0.05, y: 0.5 }, SCALE, ASPECT)).toBe(
+      "near-edge",
+    );
+    expect(classifyAnchorPlacement({ x: ASPECT / 2, y: 0.02 }, SCALE, ASPECT)).toBe(
+      "near-edge",
+    );
+    expect(classifyAnchorPlacement({ x: ASPECT / 2, y: 0.98 }, SCALE, ASPECT)).toBe(
+      "near-edge",
+    );
+  });
+
+  it("treats the margin as inclusive so the boundary itself is usable", () => {
+    expect(classifyAnchorPlacement({ x: MARGIN, y: 0.5 }, SCALE, ASPECT)).toBe("ok");
+    expect(classifyAnchorPlacement({ x: MARGIN - 1e-6, y: 0.5 }, SCALE, ASPECT)).toBe(
+      "near-edge",
+    );
+    expect(classifyAnchorPlacement({ x: ASPECT / 2, y: MARGIN }, SCALE, ASPECT)).toBe(
+      "ok",
+    );
+  });
+
+  it("reports hand-too-large when no position in the frame could satisfy the margin", () => {
+    // scale 0.7 needs 0.56 clearance on each side: 1.12 > frame height.
+    expect(
+      classifyAnchorPlacement({ x: ASPECT / 2, y: 0.5 }, 0.7, ASPECT),
+    ).toBe("hand-too-large");
+  });
+
+  it("keeps the vertical axis the binding constraint on a wide frame", () => {
+    // Frame height 1 is the tight axis at 16:9, so the cutoff is where the two
+    // margins fill it exactly: scale = 1 / (2 * 0.8) = 0.625. Straddling that
+    // value proves the vertical axis, not the wider horizontal one, decides.
+    const centre = { x: ASPECT / 2, y: 0.5 };
+    expect(classifyAnchorPlacement(centre, 0.62, ASPECT)).toBe("ok");
+    expect(classifyAnchorPlacement(centre, 0.63, ASPECT)).toBe("hand-too-large");
+    // Both still leave room horizontally, so x alone would have accepted them.
+    expect(ANCHOR_EDGE_MARGIN_SPAN * 0.63 * 2).toBeLessThan(ASPECT);
   });
 });

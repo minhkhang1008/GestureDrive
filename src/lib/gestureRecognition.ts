@@ -10,16 +10,6 @@ export interface Landmark {
 
 export type Handedness = "Left" | "Right";
 export type ScreenSide = "left" | "right";
-export type SetupPose = "open" | "fist" | "other";
-/**
- * "absent" is not a recognized pose — it is produced by the hook when the speed
- * hand is out of frame or not trusted, and means the locked value is being
- * held. recognizeSpeedPose never returns it.
- */
-export type SpeedGestureState = "adjusting" | "locked" | "invalid" | "absent";
-/** What recognizeSpeedPose can actually classify from landmarks. */
-export type RecognizedSpeedPose = Exclude<SpeedGestureState, "absent">;
-export type PalmOrientation = "palm" | "back";
 
 export interface Point {
   x: number;
@@ -27,10 +17,8 @@ export interface Point {
 }
 
 const WRIST = 0;
-const MCP = { thumb: 2, index: 5, middle: 9, ring: 13, pinky: 17 };
-const PIP = { index: 6, middle: 10, ring: 14, pinky: 18 };
-const DIP = { index: 7, middle: 11, ring: 15, pinky: 19 };
-const TIP = { thumb: 4, index: 8, middle: 12, ring: 16, pinky: 20 };
+const MCP = { index: 5, middle: 9, ring: 13, pinky: 17 };
+const TIP = { middle: 12 };
 
 // ---------------------------------------------------------------------------
 // Tunable thresholds. Displacement thresholds are in "span units": planar
@@ -47,15 +35,6 @@ export const FULL_DEFLECTION_SPAN = 1.1;
 export const DRIVE_EXPO = 0.3;
 /** Angular hysteresis so the displayed sector does not flicker on boundaries. */
 export const SECTOR_HYSTERESIS_DEG = 8;
-/** Palm/back flip hysteresis, in span units of index-vs-pinky MCP offset. */
-export const ORIENTATION_HYSTERESIS_SPAN = 0.06;
-/** |throttle| above which the palm orientation gate applies. */
-export const ORIENTATION_GATE_THROTTLE = 200;
-
-export const PINCH_ENTER_RATIO = 0.42;
-export const PINCH_EXIT_RATIO = 0.56;
-/** Moving the pinch one hand-span vertically changes speed by this much. */
-export const SPEED_DRAG_GAIN_PER_SPAN = 500;
 
 /** Hands smaller than this (planar span units of palm scale) are unreliable. */
 export const MIN_PALM_SCALE = 0.05;
@@ -84,15 +63,6 @@ export function toPlanar(point: Point, aspect: number): Point {
 
 function distance2D(a: Landmark, b: Landmark, aspect: number): number {
   return Math.hypot((a.x - b.x) * aspect, a.y - b.y);
-}
-
-function jointAngle(a: Landmark, b: Landmark, c: Landmark): number {
-  const ab = { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
-  const cb = { x: c.x - b.x, y: c.y - b.y, z: c.z - b.z };
-  const dot = ab.x * cb.x + ab.y * cb.y + ab.z * cb.z;
-  const lengths = Math.hypot(ab.x, ab.y, ab.z) * Math.hypot(cb.x, cb.y, cb.z);
-  if (lengths === 0) return 0;
-  return (Math.acos(Math.min(1, Math.max(-1, dot / lengths))) * 180) / Math.PI;
 }
 
 function lm(landmarks: Landmark[], index: number): Landmark {
@@ -135,130 +105,43 @@ export function handSpan(landmarks: Landmark[]): number {
 }
 
 // ---------------------------------------------------------------------------
-// Finger state with per-finger hysteresis
+// Where the joystick centre is allowed to sit
 // ---------------------------------------------------------------------------
 
-interface FingerGate {
-  proximalAngle: number;
-  distalAngle: number;
-  lengthRatio: number;
-}
-
-const FINGER_ENTER: FingerGate = { proximalAngle: 150, distalAngle: 145, lengthRatio: 1.08 };
-const FINGER_EXIT: FingerGate = { proximalAngle: 140, distalAngle: 135, lengthRatio: 1.02 };
-const THUMB_ENTER = { angle: 145, lengthRatio: 1.08 };
-const THUMB_EXIT = { angle: 135, lengthRatio: 1.02 };
-
-function fingerExtended(
-  landmarks: Landmark[],
-  mcp: number,
-  pip: number,
-  dip: number,
-  tip: number,
-  wasExtended: boolean,
-): boolean {
-  const gate = wasExtended ? FINGER_EXIT : FINGER_ENTER;
-  return (
-    jointAngle(lm(landmarks, mcp), lm(landmarks, pip), lm(landmarks, dip)) >
-      gate.proximalAngle &&
-    jointAngle(lm(landmarks, pip), lm(landmarks, dip), lm(landmarks, tip)) >
-      gate.distalAngle &&
-    distance2D(lm(landmarks, tip), lm(landmarks, WRIST), 1) >
-      distance2D(lm(landmarks, pip), lm(landmarks, WRIST), 1) * gate.lengthRatio
-  );
-}
-
 /**
- * Rotation-resistant finger state: [thumb, index, middle, ring, pinky].
- * Passing the previous frame's result enables per-finger hysteresis so a
- * finger hovering near a threshold cannot flap between extended and curled.
+ * Required clearance from every frame edge, in palm spans. At 0.8 spans the
+ * operator can still reach roughly 70% deflection toward the nearest edge,
+ * which the expo curve already makes a fast command.
  */
-export function fingersUp(
-  landmarks: Landmark[],
-  previous: boolean[] | null = null,
-): boolean[] {
-  const thumbGate = previous?.[0] ? THUMB_EXIT : THUMB_ENTER;
-  const thumb =
-    jointAngle(lm(landmarks, MCP.thumb), lm(landmarks, 3), lm(landmarks, TIP.thumb)) >
-      thumbGate.angle &&
-    distance2D(lm(landmarks, TIP.thumb), lm(landmarks, MCP.index), 1) >
-      distance2D(lm(landmarks, 3), lm(landmarks, MCP.index), 1) * thumbGate.lengthRatio;
-  const index = fingerExtended(
-    landmarks, MCP.index, PIP.index, DIP.index, TIP.index, previous?.[1] ?? false,
-  );
-  const middle = fingerExtended(
-    landmarks, MCP.middle, PIP.middle, DIP.middle, TIP.middle, previous?.[2] ?? false,
-  );
-  const ring = fingerExtended(
-    landmarks, MCP.ring, PIP.ring, DIP.ring, TIP.ring, previous?.[3] ?? false,
-  );
-  const pinky = fingerExtended(
-    landmarks, MCP.pinky, PIP.pinky, DIP.pinky, TIP.pinky, previous?.[4] ?? false,
-  );
-  return [thumb, index, middle, ring, pinky];
-}
+export const ANCHOR_EDGE_MARGIN_SPAN = 0.8;
 
-export function recognizeSetupPose(fingers: boolean[]): SetupPose {
-  const longFingerCount = fingers.slice(1).filter(Boolean).length;
-  // Ignore the thumb during role setup. Its state is much more sensitive to
-  // camera angle, while the four long fingers clearly distinguish open/fist.
-  if (longFingerCount === 4) return "open";
-  if (longFingerCount === 0) return "fist";
-  return "other";
-}
-
-// ---------------------------------------------------------------------------
-// Palm orientation with hysteresis
-// ---------------------------------------------------------------------------
+export type AnchorPlacement = "ok" | "near-edge" | "hand-too-large";
 
 /**
- * Signed projection of the palm normal onto the camera axis, normalized by the
- * squared palm scale so it is invariant to distance. Positive means the palm
- * faces the camera, negative the back of the hand; the magnitude grows from 0
- * (hand exactly edge-on) toward ~1 (palm square to the camera).
+ * Whether a palm position is a legitimate joystick centre.
  *
- * This is the 2D cross product of the wrist->index-MCP and wrist->pinky-MCP
- * vectors, i.e. twice the signed area of the palm triangle as projected on
- * screen. Unlike a plain index-vs-pinky x offset it does not depend on how the
- * hand is rotated in the image plane, so the forward/reverse gate keeps
- * working with the fingers pointing sideways or down.
+ * Planting the origin wherever the hand first appears puts it against the
+ * frame edge when the hand enters from the side, and there is then no room to
+ * drag that way at all. Both inputs are in planar space (x already multiplied
+ * by the aspect ratio), so the frame spans x in [0, aspect] and y in [0, 1].
+ *
+ * "hand-too-large" means the required margin cannot fit in the frame at any
+ * position, i.e. the hand is so close to the camera that the operator has to
+ * move back rather than move sideways.
  */
-export function palmFacingSigned(
-  landmarks: Landmark[],
-  handedness: Handedness,
+export function classifyAnchorPlacement(
+  palm: Point,
+  scale: number,
   aspect: number,
-): number {
-  const wrist = lm(landmarks, WRIST);
-  const index = lm(landmarks, MCP.index);
-  const pinky = lm(landmarks, MCP.pinky);
-  const ax = (index.x - wrist.x) * aspect;
-  const ay = index.y - wrist.y;
-  const bx = (pinky.x - wrist.x) * aspect;
-  const by = pinky.y - wrist.y;
-  const cross = ax * by - ay * bx;
-  const scale = palmScalePlanar(landmarks, aspect);
-  // In mirrored space the palm triangle of a right hand facing the camera
-  // winds clockwise (negative cross product); a left hand winds the other way.
-  return (handedness === "Right" ? -cross : cross) / (scale * scale);
-}
-
-/**
- * Whether the palm or the back of the hand faces the camera, with hysteresis
- * so an edge-on hand does not flicker between the two. Works in the mirrored
- * space produced by mirrorLandmarks.
- */
-export function resolvePalmOrientation(
-  landmarks: Landmark[],
-  handedness: Handedness,
-  previous: PalmOrientation | null,
-  aspect: number,
-): PalmOrientation {
-  const signed = palmFacingSigned(landmarks, handedness, aspect);
-  if (previous === null) return signed >= 0 ? "palm" : "back";
-  if (previous === "palm") {
-    return signed < -ORIENTATION_HYSTERESIS_SPAN ? "back" : "palm";
-  }
-  return signed > ORIENTATION_HYSTERESIS_SPAN ? "palm" : "back";
+): AnchorPlacement {
+  const margin = ANCHOR_EDGE_MARGIN_SPAN * scale;
+  if (margin * 2 >= 1 || margin * 2 >= aspect) return "hand-too-large";
+  const inside =
+    palm.x >= margin &&
+    palm.x <= aspect - margin &&
+    palm.y >= margin &&
+    palm.y <= 1 - margin;
+  return inside ? "ok" : "near-edge";
 }
 
 // ---------------------------------------------------------------------------
@@ -381,55 +264,6 @@ export function stickySector(
 
 export function directionName(code: DirectionCode): string {
   return COMMANDS[code].label;
-}
-
-// ---------------------------------------------------------------------------
-// Speed hand: pinch pose classification (the drag itself lives in the hook)
-// ---------------------------------------------------------------------------
-
-export interface SpeedPose {
-  state: RecognizedSpeedPose;
-  fingers: boolean[];
-  pinchRatio: number;
-  /** Normalized image y of the thumb-index midpoint (0 top, 1 bottom). */
-  pinchY: number;
-}
-
-export function normalizedPinchDistance(
-  landmarks: Landmark[],
-  aspect: number,
-): number {
-  return (
-    distance2D(lm(landmarks, TIP.thumb), lm(landmarks, TIP.index), aspect) /
-    palmScalePlanar(landmarks, aspect)
-  );
-}
-
-/**
- * The speed hand acts like a draggable slider: thumb-index pinch grabs it,
- * vertical motion adjusts, release locks the value. Two of the three
- * supporting fingers must stay open so a fist or an accidental finger
- * crossing is never mistaken for a speed command.
- */
-export function recognizeSpeedPose(
-  landmarks: Landmark[],
-  previousFingers: boolean[] | null,
-  wasPinching: boolean,
-  aspect: number,
-): SpeedPose {
-  const fingers = fingersUp(landmarks, previousFingers);
-  const supportingFingerCount = fingers.slice(2).filter(Boolean).length;
-  const pinchRatio = normalizedPinchDistance(landmarks, aspect);
-  const pinchThreshold = wasPinching ? PINCH_EXIT_RATIO : PINCH_ENTER_RATIO;
-  const pinchY = (lm(landmarks, TIP.thumb).y + lm(landmarks, TIP.index).y) / 2;
-
-  if (supportingFingerCount >= 2 && pinchRatio <= pinchThreshold) {
-    return { state: "adjusting", fingers, pinchRatio, pinchY };
-  }
-  if (supportingFingerCount >= 2) {
-    return { state: "locked", fingers, pinchRatio, pinchY };
-  }
-  return { state: "invalid", fingers, pinchRatio, pinchY };
 }
 
 export const HAND_CONNECTIONS: [number, number][] = [

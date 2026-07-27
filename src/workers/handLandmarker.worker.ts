@@ -87,7 +87,10 @@ async function createLandmarker(
       delegate: selectedDelegate,
     },
     runningMode: "VIDEO",
-    numHands: 2,
+    // One hand only. The steering hand carries both throttle and steering via
+    // its displacement, so a second hand would double inference cost for
+    // nothing. Halving numHands is the single biggest AI latency win here.
+    numHands: 1,
     minHandDetectionConfidence: 0.55,
     minHandPresenceConfidence: 0.55,
     minTrackingConfidence: 0.55,

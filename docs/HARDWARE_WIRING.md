@@ -9,7 +9,7 @@
 - Xác nhận carrier dùng 3.3 V trực tiếp hay có regulator. Không cấp 5 V vào chân
   logic SX1262 nếu carrier không cho phép.
 - Nguồn motor không lấy từ chân 3.3 V/5 V của ESP32. Nối mass chung.
-- Tần số 920.5 MHz và công suất 5 dBm vẫn phải phù hợp quy định địa phương.
+- Tần số 920.5 MHz và công suất 14 dBm vẫn phải phù hợp quy định địa phương.
 
 ## ESP1 tới SX1262
 
